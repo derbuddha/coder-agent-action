@@ -51,8 +51,7 @@ jobs:
         # actions/checkout (pull-mirrored from GitHub) regardless of the
         # instance's [actions] DEFAULT_ACTIONS_URL. A bare `actions/checkout@v4`
         # resolves to github.com unless that is set to `self` — an internet call
-        # you may not want. (No local mirror? The README does the same fetch as
-        # a plain git-clone script.)
+        # you may not want.
         uses: https://gitea.example.com/actions/checkout@v4
         with:
           repository: gitea/coder-agent-action

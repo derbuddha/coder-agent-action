@@ -43,11 +43,32 @@ one variable per job.
 
 ### 2. The workflow file
 
-Save as `.gitea/workflows/coder-agent.yaml`, then create a label named
-**`coder-agent`** in *Issues → Labels*.
+Save `coder-agent.yaml` from this repo as `.gitea/workflows/coder-agent.yaml`
+in the consumer repo, then create a label named **`coder-agent`** in
+*Issues → Labels*. Point `repository:` at wherever this action's repo actually
+lives, and the `actions/checkout` URL at your instance.
 
 ```yaml
 name: Coder Agent on Issue
+# .gitea/workflows/coder-agent.yaml — drop this into any repo that should get
+# an agent when an issue is labelled.
+#
+# run-name overrides the run title so it shows the ISSUE instead of main's
+# latest commit message. (If your Gitea version ignores run-name — see
+# go-gitea/gitea#34247 — the commit message will still show; that's the bug,
+# not this config.)
+#
+# The action repo is fetched with actions/checkout, not `uses:` — see above.
+#
+# Token: the automatic per-job token is minted for THIS repository and will be
+# refused on the action repo, so ACTION_CLONE_TOKEN carries the fetch and the
+# job token is only a fallback for the day the action repo goes public.
+#
+# ACTION_CLONE_TOKEN:
+#   a PAT with read:repository scope, from an account that can see the action
+#   repo. Set it ONCE on the org so every repo inherits it.
+#   Gitea rejects secret names starting with GITEA_ or GITHUB_.
+
 run-name: "Coder Agent · issue #${{ gitea.event.issue.number }} — ${{ gitea.event.issue.title }}"
 
 on:
@@ -60,6 +81,9 @@ permissions:
   pull-requests: write
 
 jobs:
+  # One job per label: to wire a second label to another template or model,
+  # copy this job, change the label in `if:` and point AGENT_TEMPLATE at its
+  # own variable (e.g. vars.AGENT_TEMPLATE_CLAUDE).
   agent:
     runs-on: ubuntu-24.04
     # Gitea maps `labeled` to action `label_updated`; the added label's name is
@@ -67,71 +91,55 @@ jobs:
     if: ${{ gitea.event.action == 'label_updated' && gitea.event.changes.added_labels[0].name == 'coder-agent' }}
     steps:
       - name: Fetch the action
-        env:
-          JOB_TOKEN:   ${{ secrets.GITEA_TOKEN }}          # automatic, repo-scoped
-          ACTION_PAT:  ${{ secrets.ACTION_CLONE_TOKEN }}   # fallback, may be empty
-          ACTION_REPO: gitea.example.com/gitea/coder-agent-action.git
-          ACTION_REF:  main
-          DEST:        /tmp/coder-agent-action
-        run: |
-          set -euo pipefail
-          # Without this, a rejected credential turns into an interactive prompt
-          # and the useless "could not read Username ...: No such device".
-          export GIT_TERMINAL_PROMPT=0
-          command -v git >/dev/null || (apt-get update -qq && apt-get install -y -qq git)
-          command -v jq  >/dev/null || (apt-get update -qq && apt-get install -y -qq jq)
-
-          try_clone() {  # $1 = token
-            [ -n "${1:-}" ] || return 1
-            rm -rf "$DEST"
-            # Gitea accepts the token in place of the username.
-            git clone -q --depth 1 -b "$ACTION_REF" "https://$1@$ACTION_REPO" "$DEST" 2>/dev/null
-          }
-
-          if try_clone "$JOB_TOKEN"; then
-            echo "Cloned with the automatic per-job token — no PAT needed."
-          elif try_clone "$ACTION_PAT"; then
-            echo "Per-job token was refused; cloned with ACTION_CLONE_TOKEN."
-          else
-            echo "Could not clone https://${ACTION_REPO%.git}"
-            if [ -z "${ACTION_PAT:-}" ]; then
-              echo "The per-job token is scoped to this repository only, and no"
-              echo "ACTION_CLONE_TOKEN secret is set. Either add a PAT as ACTION_CLONE_TOKEN"
-              echo "(ideally an org-level secret), or make the action repo public."
-            else
-              echo "ACTION_CLONE_TOKEN is set but was also refused — check its scope"
-              echo "(read:repository) and that its owner can see that repo."
-            fi
-            exit 1
-          fi
-          git -C "$DEST" remote remove origin
-          ls "$DEST"
+        # Absolute URL on purpose: it pins the fetch to your own mirror of
+        # actions/checkout (pull-mirrored from GitHub) regardless of the
+        # instance's [actions] DEFAULT_ACTIONS_URL. A bare `actions/checkout@v4`
+        # resolves to github.com unless that is set to `self` — an internet call
+        # you may not want.
+        uses: https://gitea.example.com/actions/checkout@v4
+        with:
+          repository: gitea/coder-agent-action
+          ref: main
+          # PAT first; the per-job token only works if the repo becomes public.
+          token: ${{ secrets.ACTION_CLONE_TOKEN || secrets.GITEA_TOKEN }}
+          path: .action
+          # Don't leave the PAT in .action/.git/config for the agent to find.
+          persist-credentials: false
+          # Only if the runner's GITHUB_SERVER_URL is wrong (e.g. Gitea behind
+          # a subpath — go-gitea/gitea#33629):
+          # github-server-url: https://gitea.example.com
 
       - name: Run Coder Agent on this issue
         env:
           CODER_URL:           ${{ vars.CODER_URL }}
           CODER_SESSION_TOKEN: ${{ secrets.CODER_TOKEN }}
           CODER_ORG:           ${{ vars.CODER_ORG_ID }}
+          # Template name comes from the repo (or org) variable, so switching
+          # templates is a settings change, not a commit.
           AGENT_TEMPLATE:      ${{ vars.AGENT_TEMPLATE }}
+          # Optional: pin a model by name (empty = deployment default).
           AGENT_MODEL:         ${{ vars.AGENT_MODEL }}
           FORGE_TOKEN:         ${{ secrets.GITEA_TOKEN }}   # automatic per-job token
-          STOP_AFTER:          "1h"
-          # Only if the clone inside the workspace fails — the log prints the
-          # URL it used just before creating the workspace:
+          STOP_AFTER:          "1h"    # keep the workspace for debugging
+          # The clone URL comes from the repo's own ssh_url. Only set these if
+          # the clone inside the workspace fails — the log prints the URL it
+          # used just before creating the workspace:
           # GITEA_SSH_HOST:    git-ssh.example.com
           # GITEA_SSH_PORT:    "2222"
-        # Flat layout: the script sits at the root of the action repo.
-        run: bash /tmp/coder-agent-action/coder-agent-issue.sh
+        # Flat layout: the script sits at the root of the action repo. curl and
+        # jq come from the composite wrapper we skipped, so check them here.
+        run: |
+          set -euo pipefail
+          need=""
+          command -v curl >/dev/null || need="$need curl"
+          command -v jq   >/dev/null || need="$need jq"
+          [ -z "$need" ] || { apt-get update -qq && apt-get install -y -qq $need; }
+          bash "$GITHUB_WORKSPACE/.action/coder-agent-issue.sh"
 ```
 
-Point `ACTION_REPO` at wherever this action's repo actually lives. If your
-instance mirrors `actions/checkout`, you can do the same fetch with that action
-instead of this script — it clones any repo on the instance when given
-`repository` + `token`; that is what `coder-agent.yaml` in this repo does by
-default. If your runner's per-job token can already read the action repo (same
-repo, same org with open visibility, or the action repo is public), you can
-skip the "Fetch the action" step entirely and use the plain composite form
-instead:
+**Action repo public**, or in the same repo/org the per-job token can read? Then
+drop both steps and let Gitea resolve the action itself — inputs instead of env
+vars, and no PAT:
 
 ```yaml
       - name: Coder Agent
@@ -141,7 +149,9 @@ instead:
           coder-token:         ${{ secrets.CODER_TOKEN }}
           coder-organization:  ${{ vars.CODER_ORG_ID }}
           coder-template-name: ${{ vars.AGENT_TEMPLATE }}
+          coder-model:         ${{ vars.AGENT_MODEL }}
           gitea-token:         ${{ secrets.GITEA_TOKEN }}
+          stop-after:          "1h"
 ```
 
 ## What it does
