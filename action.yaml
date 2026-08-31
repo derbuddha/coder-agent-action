@@ -1,0 +1,215 @@
+name: "Coder Agent on Issue"
+description: >-
+  Run a Coder Agent (experimental Chats API) against a Gitea issue in a
+  workspace built from one of your templates, then open a pull request.
+author: "GITEA"
+
+branding:
+  icon: cpu
+  color: blue
+
+inputs:
+  # --- Coder -----------------------------------------------------------------
+  coder-url:
+    description: "Base URL of the Coder deployment, e.g. https://coder.example.com"
+    required: true
+  coder-token:
+    description: "Coder session token of a service account (Coder-Session-Token header)."
+    required: true
+  coder-organization:
+    description: "Coder organization NAME or UUID. Names are resolved to a UUID."
+    required: false
+    default: "coder"
+  coder-template-name:
+    description: "Template NAME to build the workspace from, e.g. dockerUbuntuPython-agent."
+    required: false
+    default: ""
+  coder-template-id:
+    description: "Template UUID. Wins over coder-template-name if both are set."
+    required: false
+    default: ""
+  coder-model:
+    description: "Model name to pin, resolved via /model-configs (e.g. MiniMax-M3). Empty = deployment default."
+    required: false
+    default: ""
+  coder-model-config-id:
+    description: "model_config_id UUID. Wins over coder-model."
+    required: false
+    default: ""
+  coder-chat-path:
+    description: "UI route prefix for a chat, used to build the link posted on the issue."
+    required: false
+    default: "/agents/"
+  workspace-name-prefix:
+    description: "Prefix for the generated workspace name (lowercased, sanitised, truncated to 32 chars)."
+    required: false
+    default: "agent"
+  git-repo-parameter:
+    description: "Name of the template's rich parameter that receives the clone URL."
+    required: false
+    default: "git_repo_url"
+  workspace-checkout-dir:
+    description: "Directory inside the workspace where the template clones the repo."
+    required: false
+    default: "/home/coder/GIT"
+
+  # --- Gitea -----------------------------------------------------------------
+  gitea-url:
+    description: "Gitea base URL. Defaults to the server URL of the current run."
+    required: false
+    default: ""
+  gitea-token:
+    description: >-
+      Gitea token with repo + issue + PR scope. In Actions use
+      secrets.GITEA_TOKEN (the automatic per-job token) — it is passed through
+      as FORGE_TOKEN because Gitea forbids secrets named GITEA_*.
+    required: true
+  gitea-ssh-host:
+    description: >-
+      Override the SSH host the workspace clones from. Leave empty to use the
+      repository's own ssh_url (from the event payload / API) — only set this
+      when the host Gitea advertises isn't reachable from the Coder workspace.
+    required: false
+    default: ""
+  gitea-ssh-port:
+    description: "Override the SSH port. Leave empty to use the one in the repository's ssh_url."
+    required: false
+    default: ""
+  repo-owner:
+    description: "Repository owner. Defaults to the current repository."
+    required: false
+    default: ""
+  repo-name:
+    description: "Repository name. Defaults to the current repository."
+    required: false
+    default: ""
+  issue-number:
+    description: "Issue to work on. Defaults to the issue of the triggering event."
+    required: false
+    default: ""
+  base-branch:
+    description: "Base branch for the pull request."
+    required: false
+    default: "main"
+  branch-prefix:
+    description: "Work branch is <branch-prefix><issue-number>."
+    required: false
+    default: "ai/issue-"
+
+  # --- behaviour -------------------------------------------------------------
+  extra-prompt:
+    description: "Extra instructions appended to the generated prompt (project conventions, test command, ...)."
+    required: false
+    default: ""
+  finish-script-path:
+    description: "Path of the deterministic git wrapper inside the repository."
+    required: false
+    default: ".gitea/scripts/finish-issue.sh"
+  bootstrap-finish-script:
+    description: >-
+      If the finish script is missing from the base branch, commit the copy
+      shipped with this action to it before starting the agent.
+    required: false
+    default: "true"
+  comment-on-issue:
+    description: "Post a start comment and a result comment on the issue."
+    required: false
+    default: "true"
+  stop-after:
+    description: >-
+      Workspace lifecycle after the run: 1h / 30m / 90s / 3600 = auto-stop that
+      far in the future, now = stop immediately, off = leave running.
+    required: false
+    default: "1h"
+  poll-timeout:
+    description: "Seconds to wait for the agent to go running -> waiting."
+    required: false
+    default: "2400"
+  build-timeout:
+    description: "Seconds to wait for the workspace build to reach running."
+    required: false
+    default: "900"
+  fail-on-no-pr:
+    description: "Fail the job when the run ends without a pull request."
+    required: false
+    default: "true"
+
+outputs:
+  chat-id:
+    description: "ID of the created agent chat."
+    value: ${{ steps.agent.outputs.chat-id }}
+  chat-url:
+    description: "Link to the agent chat."
+    value: ${{ steps.agent.outputs.chat-url }}
+  workspace-id:
+    description: "ID of the created workspace."
+    value: ${{ steps.agent.outputs.workspace-id }}
+  workspace-url:
+    description: "Link to the workspace."
+    value: ${{ steps.agent.outputs.workspace-url }}
+  branch:
+    description: "Branch the agent pushed."
+    value: ${{ steps.agent.outputs.branch }}
+  branch-url:
+    description: "Link to the pushed branch (also set as the issue's Branch/Tag sidebar field)."
+    value: ${{ steps.agent.outputs.branch-url }}
+  pr-url:
+    description: "URL of the pull request, empty if none was created."
+    value: ${{ steps.agent.outputs.pr-url }}
+  result:
+    description: "success | no-pr | failed"
+    value: ${{ steps.agent.outputs.result }}
+
+runs:
+  using: composite
+  steps:
+    - name: Ensure curl and jq
+      shell: bash
+      run: |
+        need=""
+        command -v curl >/dev/null || need="$need curl"
+        command -v jq   >/dev/null || need="$need jq"
+        if [ -n "$need" ]; then
+          if command -v apt-get >/dev/null; then
+            apt-get update -qq && apt-get install -y -qq $need
+          elif command -v apk >/dev/null; then
+            apk add --no-cache $need
+          else
+            echo "Missing:$need and no known package manager."; exit 1
+          fi
+        fi
+
+    - name: Run Coder Agent on the issue
+      id: agent
+      shell: bash
+      env:
+        CODER_URL:            ${{ inputs.coder-url }}
+        CODER_SESSION_TOKEN:  ${{ inputs.coder-token }}
+        CODER_ORG:            ${{ inputs.coder-organization }}
+        AGENT_TEMPLATE:       ${{ inputs.coder-template-name }}
+        AGENT_TEMPLATE_ID:    ${{ inputs.coder-template-id }}
+        AGENT_MODEL:          ${{ inputs.coder-model }}
+        MODEL_CONFIG_ID:      ${{ inputs.coder-model-config-id }}
+        CODER_CHAT_PATH:      ${{ inputs.coder-chat-path }}
+        WS_NAME_PREFIX:       ${{ inputs.workspace-name-prefix }}
+        GIT_REPO_PARAM:       ${{ inputs.git-repo-parameter }}
+        WS_CHECKOUT_DIR:      ${{ inputs.workspace-checkout-dir }}
+        GITEA_URL:            ${{ inputs.gitea-url }}
+        FORGE_TOKEN:          ${{ inputs.gitea-token }}
+        GITEA_SSH_HOST:       ${{ inputs.gitea-ssh-host }}
+        GITEA_SSH_PORT:       ${{ inputs.gitea-ssh-port }}
+        REPO_OWNER:           ${{ inputs.repo-owner }}
+        REPO_NAME:            ${{ inputs.repo-name }}
+        ISSUE_NUM:            ${{ inputs.issue-number }}
+        BASE_BRANCH:          ${{ inputs.base-branch }}
+        BRANCH_PREFIX:        ${{ inputs.branch-prefix }}
+        EXTRA_PROMPT:         ${{ inputs.extra-prompt }}
+        FINISH_SCRIPT_PATH:   ${{ inputs.finish-script-path }}
+        BOOTSTRAP_FINISH:     ${{ inputs.bootstrap-finish-script }}
+        COMMENT_ON_ISSUE:     ${{ inputs.comment-on-issue }}
+        STOP_AFTER:           ${{ inputs.stop-after }}
+        POLL_TIMEOUT:         ${{ inputs.poll-timeout }}
+        BUILD_TIMEOUT:        ${{ inputs.build-timeout }}
+        FAIL_ON_NO_PR:        ${{ inputs.fail-on-no-pr }}
+        ACTION_PATH:          ${{ github.action_path }}
+      run: bash "${{ github.action_path }}/coder-agent-issue.sh"
