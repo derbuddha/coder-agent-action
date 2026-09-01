@@ -33,7 +33,7 @@ will **run** the workflow — not on the action's own repo.
 | `GITEA_TOKEN` | *(automatic)* | Gitea provides this per job — nothing to create, but it's scoped to the current repo only |
 | `ACTION_CLONE_TOKEN` | secret, optional | Fallback PAT (scope `read:repository`) used only if `GITEA_TOKEN` can't read the action's repo — e.g. the action lives in a different repo or org. Set it at the **org** level so it's a one-time thing |
 | `CODER_URL` | var | Base URL of the Coder deployment, e.g. `https://coder.example.com` |
-| `CODER_ORG_ID` | var | Coder organization name or UUID |
+| `CODER_ORG` | var, optional | Coder organization name or UUID. Unset = `coder`, the Coder default |
 | `AGENT_TEMPLATE` | var | Coder template name to build the workspace from, e.g. `dockerUbuntuPython-agent`. Set it at the **org** level and override per repo where a project needs a different image |
 | `AGENT_MODEL` | var, optional | Model name to pin (resolved via `/model-configs`); empty = deployment default |
 
@@ -113,7 +113,7 @@ jobs:
         env:
           CODER_URL:           ${{ vars.CODER_URL }}
           CODER_SESSION_TOKEN: ${{ secrets.CODER_TOKEN }}
-          CODER_ORG:           ${{ vars.CODER_ORG_ID }}
+          CODER_ORG:           ${{ vars.CODER_ORG }}
           # Template name comes from the repo (or org) variable, so switching
           # templates is a settings change, not a commit.
           AGENT_TEMPLATE:      ${{ vars.AGENT_TEMPLATE }}
@@ -147,7 +147,7 @@ vars, and no PAT:
         with:
           coder-url:           ${{ vars.CODER_URL }}
           coder-token:         ${{ secrets.CODER_TOKEN }}
-          coder-organization:  ${{ vars.CODER_ORG_ID }}
+          coder-organization:  ${{ vars.CODER_ORG }}
           coder-template-name: ${{ vars.AGENT_TEMPLATE }}
           coder-model:         ${{ vars.AGENT_MODEL }}
           gitea-token:         ${{ secrets.GITEA_TOKEN }}

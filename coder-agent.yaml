@@ -69,7 +69,7 @@ jobs:
         env:
           CODER_URL:           ${{ vars.CODER_URL }}
           CODER_SESSION_TOKEN: ${{ secrets.CODER_TOKEN }}
-          CODER_ORG:           ${{ vars.CODER_ORG_ID }}
+          CODER_ORG:           ${{ vars.CODER_ORG }}
           # Template name comes from the repo (or org) variable, so switching
           # templates is a settings change, not a commit.
           AGENT_TEMPLATE:      ${{ vars.AGENT_TEMPLATE }}
@@ -102,7 +102,7 @@ jobs:
       #   with:
       #     coder-url:           ${{ vars.CODER_URL }}
       #     coder-token:         ${{ secrets.CODER_TOKEN }}
-      #     coder-organization:  ${{ vars.CODER_ORG_ID }}
+      #     coder-organization:  ${{ vars.CODER_ORG }}
       #     coder-template-name: ${{ vars.AGENT_TEMPLATE }}
       #     coder-model:         ${{ vars.AGENT_MODEL }}
       #     gitea-token:         ${{ secrets.GITEA_TOKEN }}
