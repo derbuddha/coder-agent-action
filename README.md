@@ -163,7 +163,11 @@ vars, and no PAT:
 3. Makes sure `.gitea/scripts/finish-issue.sh` exists on the base branch or the
    issue branch — committing the shipped copy to the issue branch if it's on
    neither. See *Bootstrap* below.
-4. Reads the issue title, body and comments.
+4. Reads the issue title, body and comments. If
+   [`refine-issue-action`](#pairing-with-refine-issue-action) has already
+   expanded the issue, its generated description is part of the body and goes
+   into the prompt; only its marker lines and its "review before implementing"
+   footer are stripped, since those address a human reviewer.
 5. Creates a workspace from the template, passing the SSH clone URL as the
    `git_repo_url` rich parameter so the repo is there before the agent starts.
 6. Creates a chat pinned to that workspace and posts the chat + workspace links
@@ -176,6 +180,42 @@ vars, and no PAT:
 
 The Gitea token never leaves the runner. The workspace only pushes over the SSH
 key the template already has.
+
+## Trigger labels
+
+The workflow's `if:` decides whether the job runs, and that is the only guard
+you need for the normal setup. Two optional inputs go further:
+
+`require-label` makes the script re-check the label itself and exit with
+`result=skipped` if it isn't there — before it resolves a template, writes the
+bootstrap commit or builds a workspace, so a mistaken trigger costs one API call
+rather than a workspace. It is **empty by default** on purpose: wiring a second
+label to its own job and template is a supported pattern here, and a hardcoded
+name would make that second job skip itself. Set it per job when you use it.
+
+`remove-label` drops the trigger label after a run that opened a PR, so the
+label works like a button you press again to re-run. It is **off by default**,
+because the removal is itself a `label_updated` event and Gitea starts a run of
+every label-triggered workflow in the repo for it — each skipping on its guard,
+each still a row in the run list. The label dropped is `require-label`, or when
+that is empty the one that actually triggered this run (read from the event
+payload), so the second-label setup removes its own label rather than the first
+job's. A failed run always keeps its label, so the issue still shows it needs
+attention.
+
+## Pairing with `refine-issue-action`
+
+`gitea/refine-issue-action` is the front half of the same pipeline: label an
+issue `refine-issue-agent` and it reads the repository, writes a detailed,
+project-aware description into a delimited section of the issue body, and drops
+its own label again. Review that description, fix what it got wrong, then label
+`coder-agent` — this action picks up the enriched body and implements it.
+
+The two are independent; either works on its own. They only share the issue
+body as a hand-over, so keep `section-begin` / `section-end` at their defaults
+(`<!-- agent:begin -->` / `<!-- agent:end -->`) on both sides — this action
+strips exactly those lines out of the prompt, and overrides them via the same
+`SECTION_BEGIN` / `SECTION_END` env vars if you do change them.
 
 ## Bootstrap of `finish-issue.sh`
 
@@ -227,6 +267,8 @@ instead — the action will then never write to the repository on its own.
 | `finish-script-path` | `.gitea/scripts/finish-issue.sh` | |
 | `bootstrap-finish-script` | `true` | |
 | `comment-on-issue` | `true` | |
+| `require-label` | *(empty)* | Exits early unless the issue carries this label — a second guard behind the workflow's `if:`. Empty by default so a second label wired to its own job doesn't skip itself |
+| `remove-label` | `false` | Drop the trigger label after a run that opened a PR. Off by default; see *Trigger labels* below |
 | `stop-after` | `1h` | `1h` / `30m` / `90s` / `3600` / `now` / `off` |
 | `poll-timeout` / `build-timeout` | `2400` / `900` | seconds |
 | `fail-on-no-pr` | `true` | red job when no PR came out |
@@ -234,7 +276,7 @@ instead — the action will then never write to the repository on its own.
 ## Outputs
 
 `chat-id`, `chat-url`, `workspace-id`, `workspace-url`, `branch`, `branch-url`,
-`pr-url`, `result` (`success` | `no-pr` | `failed`).
+`pr-url`, `result` (`success` | `no-pr` | `failed` | `skipped`).
 
 ## Migrating from `coder-create-task-action`
 

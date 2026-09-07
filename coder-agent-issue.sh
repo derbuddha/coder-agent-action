@@ -66,7 +66,21 @@ BRANCH="${BRANCH_PREFIX}${ISSUE_NUM}"
 FINISH_SCRIPT_PATH="${FINISH_SCRIPT_PATH:-.gitea/scripts/finish-issue.sh}"
 BOOTSTRAP_FINISH="${BOOTSTRAP_FINISH:-true}"
 COMMENT_ON_ISSUE="${COMMENT_ON_ISSUE:-true}"
+# Optional in-script label guard. Empty by default, unlike refine-issue-action:
+# the README documents wiring a SECOND label to its own job and template, and a
+# hardcoded default would make that job skip itself. Set it to double-check the
+# workflow's own `if:` guard — worth it, since a mistaken run costs a workspace.
+REQUIRE_LABEL="${REQUIRE_LABEL-}"
+# Off by default: dropping the label is itself a label_updated event, and Gitea
+# starts a run of every label-triggered workflow for it — all of them skipping,
+# but all of them showing up in the run list.
+REMOVE_LABEL="${REMOVE_LABEL:-false}"
 WS_CHECKOUT_DIR="${WS_CHECKOUT_DIR:-/home/coder/GIT}"
+# Marker lines that gitea/refine-issue-action writes around its generated
+# section. Kept in sync with that action's section-begin / section-end inputs;
+# only used to strip the scaffolding out of the prompt.
+SECTION_BEGIN="${SECTION_BEGIN:-<!-- agent:begin -->}"
+SECTION_END="${SECTION_END:-<!-- agent:end -->}"
 GIT_REPO_PARAM="${GIT_REPO_PARAM:-git_repo_url}"
 WS_NAME_PREFIX="${WS_NAME_PREFIX:-agent}"
 CODER_CHAT_PATH="${CODER_CHAT_PATH:-/agents/}"
@@ -114,7 +128,28 @@ set_output() { # name value
 
 echo "==> Repo ${REPO_OWNER}/${REPO_NAME}  issue #${ISSUE_NUM}  branch ${BRANCH}"
 
-# --- 0. the SSH clone URL the workspace will use -----------------------------
+# --- 0. label guard ----------------------------------------------------------
+# Runs before anything is resolved, created or committed: a wrong trigger should
+# cost one API call, not a workspace. $ISSUE is reused by step 3.
+ISSUE=""
+if [ -n "$REQUIRE_LABEL" ]; then
+  ISSUE=$(gitea_api GET "/repos/$REPO_OWNER/$REPO_NAME/issues/$ISSUE_NUM")
+  if ! echo "$ISSUE" | jq -e --arg l "$REQUIRE_LABEL" 'any(.labels[]?; .name == $l)' >/dev/null; then
+    echo "Issue #${ISSUE_NUM} does not carry label '${REQUIRE_LABEL}' — nothing to do."
+    set_output result skipped
+    exit 0
+  fi
+fi
+
+# Which label a successful run drops: the one that was required, or failing that
+# the one that actually triggered this run — so a second label wired to its own
+# job removes itself rather than the first job's label.
+TRIGGER_LABEL="$REQUIRE_LABEL"
+if [ -z "$TRIGGER_LABEL" ] && [ -f "${GITHUB_EVENT_PATH:-/nonexistent}" ]; then
+  TRIGGER_LABEL=$(jq -r '.changes.added_labels[0].name // empty' "$GITHUB_EVENT_PATH" 2>/dev/null || true)
+fi
+
+# --- 0b. the SSH clone URL the workspace will use ----------------------------
 # Gitea already tells us this: the event payload carries .repository.ssh_url,
 # and the API returns the same. It is built from SSH_DOMAIN / SSH_PORT in
 # app.ini, so it is only correct if that is reachable *from the Coder
@@ -253,9 +288,18 @@ fi
 
 # --- 3. read the issue -------------------------------------------------------
 echo "==> Reading issue"
-ISSUE=$(gitea_api GET "/repos/$REPO_OWNER/$REPO_NAME/issues/$ISSUE_NUM")
+[ -n "$ISSUE" ] || ISSUE=$(gitea_api GET "/repos/$REPO_OWNER/$REPO_NAME/issues/$ISSUE_NUM")
 ITITLE=$(echo "$ISSUE" | jq -r '.title')
 IBODY=$(echo "$ISSUE"  | jq -r '.body // ""')
+
+# gitea/refine-issue-action wraps its generated description in marker lines and
+# signs it off with a "Review before implementing" footer. The description
+# itself is exactly what the agent should read, so keep it — but drop the
+# scaffolding, which is addressed to a human reviewer, not to the agent.
+IBODY=$(printf '%s\n' "$IBODY" \
+  | grep -vxF -e "$SECTION_BEGIN" -e "$SECTION_END" \
+  | grep -v '^_Generated from the repository context by .*Review before implementing\._$' \
+  || true)
 ICOMMENTS=$(gitea_api GET "/repos/$REPO_OWNER/$REPO_NAME/issues/$ISSUE_NUM/comments" \
   | jq -r '[.[] | "- " + (.user.login) + ": " + ((.body // "") | gsub("\n";" "))] | join("\n")' \
   2>/dev/null || echo "")
@@ -434,6 +478,23 @@ RESULT_LINKS="🔗 $(link_html "$CHAT_URL" "Agent chat") · $(link_html "$WORKSP
 issue_comment "$MSG
 
 $RESULT_LINKS"
+
+# --- drop the trigger label (opt-in) -----------------------------------------
+# Only on success: a failed run keeps its label, so the issue still shows it
+# needs attention. Best effort — never fails the run.
+if [ "$REMOVE_LABEL" = "true" ] && [ -n "$TRIGGER_LABEL" ] && [ "$RESULT" = "success" ]; then
+  [ -n "$ISSUE" ] || ISSUE=$(gitea_api GET "/repos/$REPO_OWNER/$REPO_NAME/issues/$ISSUE_NUM")
+  LABEL_ID=$(echo "$ISSUE" | jq -r --arg l "$TRIGGER_LABEL" \
+    '[.labels[]? | select(.name == $l) | .id][0] // ""')
+  if [ -n "$LABEL_ID" ]; then
+    if gitea_api DELETE "/repos/$REPO_OWNER/$REPO_NAME/issues/$ISSUE_NUM/labels/$LABEL_ID" \
+         >/dev/null 2>&1; then
+      echo "==> Removed label '${TRIGGER_LABEL}' — re-apply it to run the agent again."
+    else
+      echo "!! Could not remove label '${TRIGGER_LABEL}' — leaving it in place."
+    fi
+  fi
+fi
 
 # --- 7. workspace lifecycle --------------------------------------------------
 # Parse STOP_AFTER into seconds (-1 = leave running, 0 = stop now).

@@ -115,6 +115,23 @@ inputs:
     description: "Post a start comment and a result comment on the issue."
     required: false
     default: "true"
+  require-label:
+    description: >-
+      If set, the action exits early unless the issue currently carries this
+      label — a second guard behind the workflow's own `if:`, worth setting
+      because a mistaken run costs a Coder workspace. Empty by default, since
+      wiring a second label to its own job is a supported pattern and a
+      hardcoded name would make that job skip itself.
+    required: false
+    default: ""
+  remove-label:
+    description: >-
+      Remove the trigger label from the issue after a run that opened a PR.
+      Off by default: the removal is itself a label event, so Gitea starts (and
+      then skips) a run of every label-triggered workflow for it. The label
+      dropped is require-label, or failing that the one that triggered this run.
+    required: false
+    default: "false"
   stop-after:
     description: >-
       Workspace lifecycle after the run: 1h / 30m / 90s / 3600 = auto-stop that
@@ -157,7 +174,7 @@ outputs:
     description: "URL of the pull request, empty if none was created."
     value: ${{ steps.agent.outputs.pr-url }}
   result:
-    description: "success | no-pr | failed"
+    description: "success | no-pr | failed | skipped (require-label missing)"
     value: ${{ steps.agent.outputs.result }}
 
 runs:
@@ -207,6 +224,8 @@ runs:
         FINISH_SCRIPT_PATH:   ${{ inputs.finish-script-path }}
         BOOTSTRAP_FINISH:     ${{ inputs.bootstrap-finish-script }}
         COMMENT_ON_ISSUE:     ${{ inputs.comment-on-issue }}
+        REQUIRE_LABEL:        ${{ inputs.require-label }}
+        REMOVE_LABEL:         ${{ inputs.remove-label }}
         STOP_AFTER:           ${{ inputs.stop-after }}
         POLL_TIMEOUT:         ${{ inputs.poll-timeout }}
         BUILD_TIMEOUT:        ${{ inputs.build-timeout }}
