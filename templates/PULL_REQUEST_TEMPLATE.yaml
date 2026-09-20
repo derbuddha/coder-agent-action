@@ -1,0 +1,61 @@
+name: Pull Request
+about: Standard PR with AI summary
+title: ""
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please fill in all fields. The agent fills in the AI summary.
+    visible: [form]
+
+  - type: checkboxes
+    id: change-type
+    attributes:
+      label: Type
+      description: Kind of change — tick all that apply
+      options:
+        - label: Bug
+        - label: Feature
+        - label: Refactor / Chore
+        - label: AI Agent
+
+  - type: textarea
+    id: ai-summary
+    attributes:
+      label: AI - Summary
+      description: Brief description of the change, motivation and impact.
+      placeholder: Filled in by the agent.
+      # Marker the Coder Agent action looks for to substitute its summary
+      # block (header + summary + Refs #N + links). Leave it in place.
+      value: |
+        <!-- AI_SUMMARY -->
+    validations:
+      required: false
+
+  - type: textarea
+    id: human-summary
+    attributes:
+      label: Human - Summary
+      description: What you changed by hand on top of (or instead of) the agent's work, and why.
+      placeholder: e.g. rewrote the retry logic the agent generated, adjusted naming, dropped an unused helper.
+    validations:
+      required: false
+
+  - type: textarea
+    id: changes
+    attributes:
+      label: Changes
+      value: "- "
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: Tests pass locally
+          required: true
+        - label: Documentation updated
+        - label: Human review done
+          visible: [content]

@@ -41,7 +41,7 @@ jobs:
   # copy this job, change the label in `if:` and point AGENT_TEMPLATE at its
   # own variable (e.g. vars.AGENT_TEMPLATE_CLAUDE).
   agent:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-noble
     # Gitea maps `labeled` to action `label_updated`; the added label's name is
     # in changes.added_labels[0] (empty on unrelated events, so they skip).
     if: ${{ gitea.event.action == 'label_updated' && gitea.event.changes.added_labels[0].name == 'coder-agent' }}
@@ -77,6 +77,10 @@ jobs:
           AGENT_MODEL:         ${{ vars.AGENT_MODEL }}
           FORGE_TOKEN:         ${{ secrets.GITEA_TOKEN }}   # automatic per-job token
           STOP_AFTER:          "1h"    # keep the workspace for debugging
+          # The agent writes its 5-sentence change summary to
+          # .gitea/agent-summary.md (the action's built-in default). The action
+          # reads that file back from the branch and pastes it into the PR
+          # description. Set SUMMARY_PATH here only to override the path.
           # The clone URL comes from the repo's own ssh_url. Only set these if
           # the clone inside the workspace fails — the log prints the URL it
           # used just before creating the workspace:
@@ -107,5 +111,6 @@ jobs:
       #     coder-model:         ${{ vars.AGENT_MODEL }}
       #     gitea-token:         ${{ secrets.GITEA_TOKEN }}
       #     stop-after:          "1h"
+      #     summary-path:        ".gitea/agent-summary.md"
       #     # gitea-ssh-host:    git-ssh.example.com
       #     # gitea-ssh-port:    "2222"

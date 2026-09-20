@@ -105,14 +105,42 @@ inputs:
     description: "Path of the deterministic git wrapper inside the repository."
     required: false
     default: ".gitea/scripts/finish-issue.sh"
+  summary-path:
+    description: >-
+      Path the agent writes its 5-sentence change summary to. The action reads
+      this file from the branch after the agent pushes and pastes it into the
+      PR description between "Automated by the Coder Agent." and "Refs #N".
+      Empty = skip the summary lookup and omit the section.
+    required: false
+    default: ".gitea/agent-summary.md"
   bootstrap-finish-script:
     description: >-
       If the finish script is missing from the base branch, commit the copy
       shipped with this action to it before starting the agent.
     required: false
     default: "true"
+  pr-template-path:
+    description: >-
+      Path (in the repo) of the PR template. Defaults to
+      `.gitea/PULL_REQUEST_TEMPLATE.yaml`; the action ships a starter template
+      at `templates/PULL_REQUEST_TEMPLATE.yaml` and bootstraps it onto the
+      work branch when missing from $BASE_BRANCH (same pattern as
+      `bootstrap-finish-script`). If the file is found, the action
+      substitutes the agent's summary block (header + summary + refs + links)
+      into the `<!-- AI_SUMMARY -->` marker. Empty = use the built-in PR
+      body (legacy behaviour).
+    required: false
+    default: ".gitea/PULL_REQUEST_TEMPLATE.yaml"
+  pr-template-type:
+    description: >-
+      `markdown` (default) or `yaml`. Only affects documentation — both
+      formats are treated as raw text and the marker below is tried in both
+      cases. The action does NOT enforce required fields of a YAML form
+      template: those are for human reviewers.
+    required: false
+    default: "yaml"
   comment-on-issue:
-    description: "Post a start comment and a result comment on the issue."
+    description: "Post a start comment, a result comment, and a failure comment on the issue."
     required: false
     default: "true"
   require-label:
@@ -180,12 +208,13 @@ outputs:
 runs:
   using: composite
   steps:
-    - name: Ensure curl and jq
+    - name: Ensure curl, jq, python3 + PyYAML
       shell: bash
       run: |
         need=""
-        command -v curl >/dev/null || need="$need curl"
-        command -v jq   >/dev/null || need="$need jq"
+        command -v curl    >/dev/null || need="$need curl"
+        command -v jq      >/dev/null || need="$need jq"
+        command -v python3 >/dev/null || need="$need python3"
         if [ -n "$need" ]; then
           if command -v apt-get >/dev/null; then
             apt-get update -qq && apt-get install -y -qq $need
@@ -193,6 +222,19 @@ runs:
             apk add --no-cache $need
           else
             echo "Missing:$need and no known package manager."; exit 1
+          fi
+        fi
+        # PyYAML ships as a separate package on most distros — install it if
+        # missing, so the YAML PR template renderer always works.
+        if ! python3 -c 'import yaml' >/dev/null 2>&1; then
+          if command -v apt-get >/dev/null; then
+            apt-get install -y -qq python3-yaml
+          elif command -v apk >/dev/null; then
+            apk add --no-cache py3-yaml
+          elif command -v pip3 >/dev/null; then
+            pip3 install --quiet --break-system-packages pyyaml
+          else
+            echo "PyYAML is missing and no known package manager could install it."; exit 1
           fi
         fi
 
@@ -222,7 +264,10 @@ runs:
         BRANCH_PREFIX:        ${{ inputs.branch-prefix }}
         EXTRA_PROMPT:         ${{ inputs.extra-prompt }}
         FINISH_SCRIPT_PATH:   ${{ inputs.finish-script-path }}
+        SUMMARY_PATH:         ${{ inputs.summary-path }}
         BOOTSTRAP_FINISH:     ${{ inputs.bootstrap-finish-script }}
+        PR_TEMPLATE_PATH:     ${{ inputs.pr-template-path }}
+        PR_TEMPLATE_TYPE:     ${{ inputs.pr-template-type }}
         COMMENT_ON_ISSUE:     ${{ inputs.comment-on-issue }}
         REQUIRE_LABEL:        ${{ inputs.require-label }}
         REMOVE_LABEL:         ${{ inputs.remove-label }}

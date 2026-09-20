@@ -175,7 +175,14 @@ vars, and no PAT:
 7. Polls until `running -> waiting`, then opens `ai/issue-N -> main`, links the
    issue's Branch/Tag sidebar field to that branch, and comments the result.
    Re-labelling an issue whose PR is already open refreshes that PR's body
-   with the current run's links instead of leaving stale ones.
+   with the current run's links instead of leaving stale ones. The PR body
+   is built as `Automated by the Coder Agent.` → `📝 **Summary**` → `Refs #N`
+   → link bar; the **Summary** section is the agent's own 5-sentence change
+   summary, read back from `.gitea/agent-summary.md` on the branch (path is
+   `summary-path`, empty = skip). The agent is told in its prompt to write
+   exactly five sentences — goal, what changed, verification, caveats —
+   before the final commit-and-push, so the file is always part of the same
+   commit the action opens the PR for.
 8. Applies `stop-after` (auto-stop deadline, stop now, or leave running).
 
 The Gitea token never leaves the runner. The workspace only pushes over the SSH
@@ -265,8 +272,11 @@ instead — the action will then never write to the repository on its own.
 | `workspace-checkout-dir` | `/home/coder/GIT` | must match the template |
 | `git-repo-parameter` | `git_repo_url` | rich parameter name |
 | `finish-script-path` | `.gitea/scripts/finish-issue.sh` | |
+| `summary-path` | `.gitea/agent-summary.md` | file the agent writes its 5-sentence change summary to; the action reads it back from the branch and pastes it into the PR body. Empty = skip |
 | `bootstrap-finish-script` | `true` | |
-| `comment-on-issue` | `true` | |
+| `pr-template-path` | `.gitea/PULL_REQUEST_TEMPLATE.yaml` | repo path of the PR template. The action ships a starter template at `templates/PULL_REQUEST_TEMPLATE.yaml` and bootstraps it onto the work branch when missing from $BASE_BRANCH (same pattern as `bootstrap-finish-script`). The agent's block is substituted into the `<!-- AI_SUMMARY -->` marker. Empty = built-in body |
+| `pr-template-type` | `yaml` | `markdown` or `yaml` — only affects docs; both are treated as text and both markers are tried in either format |
+| `comment-on-issue` | `true` | covers the start, result and failure comments |
 | `require-label` | *(empty)* | Exits early unless the issue carries this label — a second guard behind the workflow's `if:`. Empty by default so a second label wired to its own job doesn't skip itself |
 | `remove-label` | `false` | Drop the trigger label after a run that opened a PR. Off by default; see *Trigger labels* below |
 | `stop-after` | `1h` | `1h` / `30m` / `90s` / `3600` / `now` / `off` |
@@ -305,6 +315,43 @@ export CODER_URL=https://coder.example.com CODER_SESSION_TOKEN=... \
        REPO_OWNER=GITEA REPO_NAME=someproject ISSUE_NUM=42
 bash coder-agent-issue.sh
 ```
+
+## Troubleshooting
+
+A failed run says why in three places: the runner log, the job summary, and a
+comment on the issue that triggered it (the last one follows `comment-on-issue`).
+Both API helpers report the HTTP status and the server's own message, so the
+cause is named rather than inferred:
+
+```
+Coder API: GET /api/experimental/chats/models -> HTTP 401
+    You are signed out or your session has expired. Please sign in again to continue.
+    (the Coder token is missing, expired or from another deployment)
+```
+
+- **HTTP 401 from Coder** — the `CODER_TOKEN` secret is expired, was deleted, or
+  belongs to another deployment. Coder tokens are created with a finite
+  lifetime; mint a new one for the service account and update the secret:
+  `coder tokens create --name gitea-actions --lifetime 1y`. (`coder tokens list`
+  shows the expiry of the ones that still exist.)
+- **HTTP 401/403 from Gitea** — `FORGE_TOKEN` (the per-job `GITEA_TOKEN` is
+  passed under that name, since Gitea forbids secrets starting with `GITEA_`)
+  can't read the issue or write the branch; it needs repo + issue + PR scope.
+- **HTTP 000** — the runner can't reach the host at all: wrong `CODER_URL` /
+  `gitea-url`, or a network the runner container isn't on.
+
+The comment on the issue looks like this:
+
+> ❌ **Coder Agent failed.**
+>
+> Could not authenticate to https://coder.example.com.
+>
+> HTTP 401 means the token is stale — mint a new one (`coder tokens create
+> --name gitea-actions --lifetime 1y`) and update the `coder-token` secret.
+> HTTP 000 means the runner cannot reach `coder-url` at all.
+
+A failure with no message of its own — a bug in the action rather than a
+misconfiguration — is still reported, with the script line that failed.
 
 ## Known rough edges
 
