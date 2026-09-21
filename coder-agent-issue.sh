@@ -12,7 +12,8 @@
 #      onto the issue branch if it's on neither branch — base branches are
 #      commonly protected, so a bot token can't write there directly; it rides
 #      into the base branch later via the normal PR merge)
-#   3. read the issue (title + body + comments) via the Gitea API
+#   3. read the issue (title + body + every comment + the attachments of
+#      both) via the Gitea API
 #   4. create a workspace from the template, passing the SSH clone URL as a
 #      rich parameter so the repo is cloned before the agent starts
 #   5. create a chat pinned to that workspace; prompt = issue text + instructions
@@ -74,6 +75,18 @@ BRANCH="${BRANCH_PREFIX}${ISSUE_NUM}"
 FINISH_SCRIPT_PATH="${FINISH_SCRIPT_PATH:-.gitea/scripts/finish-issue.sh}"
 BOOTSTRAP_FINISH="${BOOTSTRAP_FINISH:-true}"
 COMMENT_ON_ISSUE="${COMMENT_ON_ISSUE:-true}"
+# Issue attachments. The runner can read them (it holds the Gitea token), the
+# workspace cannot — so text files are pulled here and inlined into the prompt,
+# and anything binary or oversized is listed by name so the agent at least
+# knows it exists. Two budgets keep a 50 MB log out of the context window: a
+# per-file cap and a total across all inlined files.
+INCLUDE_ATTACHMENTS="${INCLUDE_ATTACHMENTS:-true}"
+ATTACHMENT_MAX_BYTES="${ATTACHMENT_MAX_BYTES:-65536}"
+ATTACHMENT_TOTAL_BYTES="${ATTACHMENT_TOTAL_BYTES:-262144}"
+# Comment paging. Gitea caps `limit` at MAX_RESPONSE_ITEMS (50 by default), so
+# the fetch below walks pages until one comes back short.
+COMMENT_PAGE_SIZE="${COMMENT_PAGE_SIZE:-50}"
+COMMENT_MAX_PAGES="${COMMENT_MAX_PAGES:-20}"
 # Path the agent writes its 5-sentence change summary to. The action reads this
 # from the branch after the agent pushes and pastes it into the PR body
 # between "Automated by the Coder Agent." and "Refs #N". Empty = skip.
@@ -163,6 +176,30 @@ coder_api() { # method path [body]
 gitea_api() { # method path [body]
   api_call Gitea "$GITEA_URL/api/v1" "Authorization: token $GITEA_TOKEN" "$@"
 }
+# Attachment bodies live on Gitea's WEB routes (/attachments/<uuid>), not under
+# /api/v1, so they can't go through api_call. --max-filesize stops a huge file
+# before it lands on the runner; curl drops the Authorization header when a
+# redirect leaves the Gitea host (object-storage backends hand out a signed
+# URL), which is exactly what we want — the token never follows the file.
+gitea_download() { # url outfile max-bytes
+  curl -fsSL --max-time 60 --max-filesize "$3" \
+    -H "Authorization: token $GITEA_TOKEN" -o "$2" "$1" 2>/dev/null
+}
+# A NUL byte is the cheap, portable "don't paste this into a prompt" test: it
+# catches images, archives and compiled blobs without an extension allowlist.
+is_binary() { # file
+  local total nulless
+  total=$(wc -c < "$1" | tr -d ' ')
+  nulless=$(LC_ALL=C tr -d '\000' < "$1" | wc -c | tr -d ' ')
+  [ "$total" != "$nulless" ]
+}
+human_size() { # bytes -> "12.3 KiB"
+  awk -v b="${1:-0}" 'BEGIN {
+    split("B KiB MiB GiB", u, " "); i = 1
+    while (b >= 1024 && i < 4) { b /= 1024; i++ }
+    printf (i == 1 ? "%d %s" : "%.1f %s"), b, u[i]
+  }'
+}
 issue_comment() { # body — best effort, never fails the run
   [ "$COMMENT_ON_ISSUE" = "true" ] || return 0
   gitea_api POST "/repos/$REPO_OWNER/$REPO_NAME/issues/$ISSUE_NUM/comments" \
@@ -184,6 +221,7 @@ set_output() { # name value
 # thing with a reason attached; a failure that never calls it still gets
 # reported, just with the script line instead of a sentence.
 LAST_API_ERROR=""; FAIL_REASON=""; FAIL_HINT=""; FAIL_LINE=""; REPORTED=false
+ATT_TMPDIR=""
 API_ERR_FILE=$(mktemp "${TMPDIR:-/tmp}/coder-agent-api-err.XXXXXX")
 
 die() { # reason [hint]
@@ -197,6 +235,7 @@ on_exit() {
   local code=$? reason="" links=""
   LAST_API_ERROR=$(cat "$API_ERR_FILE" 2>/dev/null || true)
   rm -f "$API_ERR_FILE"
+  if [ -n "${ATT_TMPDIR:-}" ]; then rm -rf "$ATT_TMPDIR"; fi
   if [ "$code" -eq 0 ]; then return 0; fi
   reason="$FAIL_REASON"
   if [ -z "$reason" ]; then
@@ -434,9 +473,100 @@ IBODY=$(printf '%s\n' "$IBODY" \
   | grep -vxF -e "$SECTION_BEGIN" -e "$SECTION_END" \
   | grep -v '^_Generated from the repository context by .*Review before implementing\._$' \
   || true)
-ICOMMENTS=$(gitea_api GET "/repos/$REPO_OWNER/$REPO_NAME/issues/$ISSUE_NUM/comments" \
-  | jq -r '[.[] | "- " + (.user.login) + ": " + ((.body // "") | gsub("\n";" "))] | join("\n")' \
-  2>/dev/null || echo "")
+
+# --- comments ----------------------------------------------------------------
+# Walk every page: Gitea's default paging is 30, so a single unpaged call fed
+# the agent the OLDEST 30 comments and silently dropped the newest ones — the
+# exact opposite of what a long discussion needs.
+echo "==> Reading comments"
+COMMENTS_JSON="[]"; cpage=1
+while [ "$cpage" -le "$COMMENT_MAX_PAGES" ]; do
+  chunk=$(gitea_api GET \
+    "/repos/$REPO_OWNER/$REPO_NAME/issues/$ISSUE_NUM/comments?page=${cpage}&limit=${COMMENT_PAGE_SIZE}" \
+    2>/dev/null) || break
+  n=$(printf '%s' "$chunk" | jq 'length' 2>/dev/null) || break
+  [ "$n" -gt 0 ] || break
+  COMMENTS_JSON=$(printf '%s\n%s\n' "$COMMENTS_JSON" "$chunk" | jq -c -s 'add')
+  if [ "$n" -lt "$COMMENT_PAGE_SIZE" ]; then break; fi
+  cpage=$((cpage + 1))
+done
+
+# Rendered verbatim — newlines and all. The old one-line-per-comment form
+# collapsed every code block, diff and stack trace into an unreadable run-on.
+# The action's own start/result/failure comments are filtered out: on a re-run
+# the agent would otherwise read its predecessor's chat links as instructions.
+ICOMMENTS=$(printf '%s' "$COMMENTS_JSON" | jq -r '
+  [ .[]?
+    | select(((.body // "") | test("^[[:space:]]*(🤖|⚠️|❌)[[:space:]]*\\*{0,2}Coder Agent")) | not)
+    | select(((.body // "") | gsub("[[:space:]]"; "")) != "")
+    | "@" + (.user.login // "unknown") + " wrote on "
+      + ((.created_at // "") | split("T")[0]) + ":\n" + (.body // "")
+  ] | join("\n\n----------\n\n")' 2>/dev/null || echo "")
+echo "    $(printf '%s' "$COMMENTS_JSON" | jq 'length') comment(s) fetched"
+
+# --- attachments -------------------------------------------------------------
+# The runner holds the Gitea token and the workspace never does, so an
+# attachment can only reach the agent through the prompt: text files are
+# inlined verbatim, everything else is named so the agent knows it exists.
+IATTACH=""
+if [ "$INCLUDE_ATTACHMENTS" = "true" ]; then
+  echo "==> Collecting attachments"
+  # Issue-level uploads have their own endpoint (older Gitea) and are also
+  # embedded in the issue object (newer Gitea); comment uploads only ever
+  # arrive embedded. Both shapes are normalised into one list that remembers
+  # where each file was posted.
+  IASSETS=$(gitea_api GET "/repos/$REPO_OWNER/$REPO_NAME/issues/$ISSUE_NUM/assets" 2>/dev/null) \
+    || IASSETS=$(printf '%s' "$ISSUE" | jq -c '.assets // []' 2>/dev/null || echo '[]')
+  ALL_ASSETS=$( {
+      printf '%s\n' "${IASSETS:-[]}" | jq -c '[ .[]? |
+        { name: (.name // "attachment"), size: (.size // 0),
+          url: (.browser_download_url // ""), origin: "the issue" } ]'
+      printf '%s\n' "$COMMENTS_JSON" | jq -c '[ .[]? | . as $c | (.assets // [])[]? |
+        { name: (.name // "attachment"), size: (.size // 0),
+          url: (.browser_download_url // ""),
+          origin: ("a comment by @" + ($c.user.login // "unknown")) } ]'
+    } | jq -c -s 'add // []' 2>/dev/null ) || ALL_ASSETS='[]'
+
+  ATT_LIST=""; ATT_BODIES=""; ATT_USED=0
+  ATT_TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/coder-agent-att.XXXXXX")
+  while IFS= read -r a; do
+    [ -n "$a" ] || continue
+    aname=$(printf '%s' "$a" | jq -r '.name')
+    asize=$(printf '%s' "$a" | jq -r '.size | floor? // 0')
+    aurl=$(printf '%s' "$a"  | jq -r '.url')
+    aorigin=$(printf '%s' "$a" | jq -r '.origin')
+    note=""
+    if [ -z "$aurl" ]; then
+      note="no download URL — not inlined"
+    elif [ "$asize" -gt "$ATTACHMENT_MAX_BYTES" ]; then
+      note="over the $(human_size "$ATTACHMENT_MAX_BYTES") per-file cap — not inlined"
+    elif [ $((ATT_USED + asize)) -gt "$ATTACHMENT_TOTAL_BYTES" ]; then
+      note="the $(human_size "$ATTACHMENT_TOTAL_BYTES") total inline budget is spent — not inlined"
+    else
+      afile="$ATT_TMPDIR/$(printf '%s' "$aname" | tr -c 'A-Za-z0-9._-' '_')"
+      if ! gitea_download "$aurl" "$afile" "$ATTACHMENT_MAX_BYTES"; then
+        note="could not be downloaded — not inlined"
+      elif is_binary "$afile"; then
+        note="binary — not inlined, you cannot open it"
+      else
+        ATT_USED=$((ATT_USED + $(wc -c < "$afile" | tr -d ' ')))
+        note="inlined below"
+        ATT_BODIES="${ATT_BODIES}
+===== BEGIN ATTACHMENT ${aname} (from ${aorigin}) =====
+$(cat "$afile")
+===== END ATTACHMENT ${aname} =====
+"
+      fi
+    fi
+    echo "    ${aname} ($(human_size "$asize"), ${aorigin}) — ${note}"
+    ATT_LIST="${ATT_LIST}- ${aname} ($(human_size "$asize"), from ${aorigin}) — ${note}${aurl:+
+  ${aurl}}
+"
+  done <<<"$(printf '%s' "$ALL_ASSETS" | jq -c '.[]?')"
+  rm -rf "$ATT_TMPDIR"; ATT_TMPDIR=""
+
+  if [ -n "$ATT_LIST" ]; then IATTACH="${ATT_LIST}${ATT_BODIES}"; fi
+fi
 
 REPO_DIR="${WS_CHECKOUT_DIR%/}/${REPO_NAME}"
 COMMIT_MSG="agent: ${ITITLE} (refs #${ISSUE_NUM})"
@@ -457,10 +587,19 @@ ${REPO_DIR}. Implement the change requested in the Gitea issue below.
 ISSUE #${ISSUE_NUM}: ${ITITLE}
 
 ${IBODY}
+${ICOMMENTS:+
+Comments on the issue, oldest first:
 
-Comments:
 ${ICOMMENTS}
+}${IATTACH:+
+Attachments uploaded to the issue or its comments. Text files are reproduced
+in full between the BEGIN/END markers below; anything binary or too large is
+listed by name only — you cannot open those, and their URLs need a Gitea
+login, so work from what the issue text says about them and say so in your
+summary if something you needed was unreadable:
 
+${IATTACH}
+}
 Instructions:
 ${CHECKOUT_STEP}- Edit the files needed to resolve the issue. Keep the diff focused.
 - NEVER overwrite an existing file wholesale. Read it first, then append or edit

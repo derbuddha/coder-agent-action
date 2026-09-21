@@ -81,6 +81,11 @@ jobs:
           # .gitea/agent-summary.md (the action's built-in default). The action
           # reads that file back from the branch and pastes it into the PR
           # description. Set SUMMARY_PATH here only to override the path.
+          # Issue attachments go into the prompt (text inlined, binaries listed).
+          # Raise the caps for repos whose issues carry big specs or logs, or set
+          # INCLUDE_ATTACHMENTS: "false" to skip the lookup:
+          # ATTACHMENT_MAX_BYTES:   "262144"
+          # ATTACHMENT_TOTAL_BYTES: "1048576"
           # The clone URL comes from the repo's own ssh_url. Only set these if
           # the clone inside the workspace fails — the log prints the URL it
           # used just before creating the workspace:

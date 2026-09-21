@@ -163,11 +163,12 @@ vars, and no PAT:
 3. Makes sure `.gitea/scripts/finish-issue.sh` exists on the base branch or the
    issue branch — committing the shipped copy to the issue branch if it's on
    neither. See *Bootstrap* below.
-4. Reads the issue title, body and comments. If
-   [`refine-issue-action`](#pairing-with-refine-issue-action) has already
-   expanded the issue, its generated description is part of the body and goes
-   into the prompt; only its marker lines and its "review before implementing"
-   footer are stripped, since those address a human reviewer.
+4. Reads the issue title, body, **every comment** and the **attachments** of
+   both, and puts them in the prompt — see *What the agent gets to read*
+   below. If [`refine-issue-action`](#pairing-with-refine-issue-action) has
+   already expanded the issue, its generated description is part of the body
+   and goes into the prompt; only its marker lines and its "review before
+   implementing" footer are stripped, since those address a human reviewer.
 5. Creates a workspace from the template, passing the SSH clone URL as the
    `git_repo_url` rich parameter so the repo is there before the agent starts.
 6. Creates a chat pinned to that workspace and posts the chat + workspace links
@@ -187,6 +188,55 @@ vars, and no PAT:
 
 The Gitea token never leaves the runner. The workspace only pushes over the SSH
 key the template already has.
+
+## What the agent gets to read
+
+The prompt is assembled on the runner — the workspace has no Gitea token, so
+anything the agent should see has to be in there.
+
+**Title and body**, in full.
+
+**Every comment**, verbatim. The fetch walks pages until one comes back short
+(Gitea's default page is 30 comments, its `limit` caps at `MAX_RESPONSE_ITEMS`,
+50 by default), so a long discussion arrives whole rather than truncated to its
+oldest page — up to 1000 comments, after which the walk stops. Line breaks are kept, so code blocks, diffs and stack traces in a
+comment stay readable. The action's own start / result / failure comments are
+filtered out — on a re-run the agent would otherwise read its predecessor's
+chat links as if they were instructions from a human.
+
+**Attachments** of the issue and of each comment (`include-attachments`,
+default on):
+
+| Attachment | What the agent gets |
+|---|---|
+| text, within both caps | the whole file, inlined between `===== BEGIN ATTACHMENT <name> =====` markers |
+| binary (image, archive, PDF) | name, size and origin only |
+| over `attachment-max-bytes` (64 KiB) | name, size and origin only |
+| past `attachment-total-bytes` (256 KiB in total) | name, size and origin only |
+| unreachable | name, size and origin, plus a note that the download failed |
+
+Text vs. binary is decided by sniffing for a NUL byte, not by extension, so an
+extension-less log or a `.patch` is inlined and a `.png` is not. Every
+attachment is listed with its download URL either way, but that URL needs a
+Gitea login — the agent cannot open it, and the prompt says so. **A screenshot
+is therefore still invisible to the agent**; if an image carries the actual
+requirement, describe it in the issue text too.
+
+Raise the caps when your issues carry big specs or logs:
+
+```yaml
+with:
+  attachment-max-bytes: "262144"    # 256 KiB per file
+  attachment-total-bytes: "1048576" # 1 MiB in total
+```
+
+Both budgets exist to stop a pile of logs crowding the issue text out of the
+model's context window; files are taken in order (issue first, then comments)
+until the total is spent.
+
+The issue is read **once**, before the workspace is built. A comment posted
+while the agent is working does not reach it — re-label the issue to start a
+fresh run that sees it.
 
 ## Trigger labels
 
@@ -277,6 +327,9 @@ instead — the action will then never write to the repository on its own.
 | `pr-template-path` | `.gitea/PULL_REQUEST_TEMPLATE.yaml` | repo path of the PR template. The action ships a starter template at `templates/PULL_REQUEST_TEMPLATE.yaml` and bootstraps it onto the work branch when missing from $BASE_BRANCH (same pattern as `bootstrap-finish-script`). The agent's block is substituted into the `<!-- AI_SUMMARY -->` marker. Empty = built-in body |
 | `pr-template-type` | `yaml` | `markdown` or `yaml` — only affects docs; both are treated as text and both markers are tried in either format |
 | `comment-on-issue` | `true` | covers the start, result and failure comments |
+| `include-attachments` | `true` | Read the files uploaded to the issue and its comments into the prompt. See *What the agent gets to read* |
+| `attachment-max-bytes` | `65536` | per-file cap for an inlined attachment; bigger files are listed, not inlined |
+| `attachment-total-bytes` | `262144` | total cap across all inlined attachments |
 | `require-label` | *(empty)* | Exits early unless the issue carries this label — a second guard behind the workflow's `if:`. Empty by default so a second label wired to its own job doesn't skip itself |
 | `remove-label` | `false` | Drop the trigger label after a run that opened a PR. Off by default; see *Trigger labels* below |
 | `stop-after` | `1h` | `1h` / `30m` / `90s` / `3600` / `now` / `off` |
@@ -374,6 +427,12 @@ misconfiguration — is still reported, with the script line that failed.
   eventually replace it with a GitHub-style "development" sidebar
   ([go-gitea/gitea#31899](https://github.com/go-gitea/gitea/issues/31899)).
   Setting it is best-effort and never fails the run.
+- Comment attachments are read from the `assets` field Gitea embeds in each
+  comment. Issue-level attachments have a dedicated endpoint
+  (`GET /repos/{owner}/{repo}/issues/{n}/assets`) and the action falls back to
+  the issue object's own `assets` field when that endpoint is missing. On a
+  Gitea old enough not to populate `assets` on comments, comment attachments
+  are simply not found — the issue's own are.
 - The `target="_blank"` links rely on Gitea's Markdown sanitizer passing
   through raw `<a target="_blank">` HTML (confirmed on stock Gitea; a locked-down
   sanitizer policy could theoretically strip the attribute — check one comment

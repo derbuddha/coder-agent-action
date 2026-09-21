@@ -143,6 +143,26 @@ inputs:
     description: "Post a start comment, a result comment, and a failure comment on the issue."
     required: false
     default: "true"
+  include-attachments:
+    description: >-
+      Read the files uploaded to the issue and its comments and put them in the
+      prompt. Text attachments are inlined verbatim; binaries (images,
+      archives) and anything over the caps below are listed by name and size
+      only, since the workspace holds no Gitea token and cannot fetch them
+      itself. Set to `false` to skip the lookup entirely.
+    required: false
+    default: "true"
+  attachment-max-bytes:
+    description: "Per-file cap for an inlined attachment. Bigger files are listed, not inlined."
+    required: false
+    default: "65536"
+  attachment-total-bytes:
+    description: >-
+      Total cap across all inlined attachments, so a pile of logs can't crowd
+      the issue text out of the model's context window. Files are taken in
+      order (issue first, then comments) until the budget is spent.
+    required: false
+    default: "262144"
   require-label:
     description: >-
       If set, the action exits early unless the issue currently carries this
@@ -269,6 +289,9 @@ runs:
         PR_TEMPLATE_PATH:     ${{ inputs.pr-template-path }}
         PR_TEMPLATE_TYPE:     ${{ inputs.pr-template-type }}
         COMMENT_ON_ISSUE:     ${{ inputs.comment-on-issue }}
+        INCLUDE_ATTACHMENTS:  ${{ inputs.include-attachments }}
+        ATTACHMENT_MAX_BYTES: ${{ inputs.attachment-max-bytes }}
+        ATTACHMENT_TOTAL_BYTES: ${{ inputs.attachment-total-bytes }}
         REQUIRE_LABEL:        ${{ inputs.require-label }}
         REMOVE_LABEL:         ${{ inputs.remove-label }}
         STOP_AFTER:           ${{ inputs.stop-after }}
