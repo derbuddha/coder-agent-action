@@ -198,6 +198,10 @@ inputs:
     description: "Fail the job when the run ends without a pull request."
     required: false
     default: "true"
+  max-nudges:
+    description: "Follow-up messages to post when the agent goes idle without pushing its branch (a model that ends its turn mid-task). 0 = off."
+    required: false
+    default: "3"
 
 outputs:
   chat-id:
@@ -218,6 +222,9 @@ outputs:
   branch-url:
     description: "Link to the pushed branch (also set as the issue's Branch/Tag sidebar field)."
     value: ${{ steps.agent.outputs.branch-url }}
+  nudges:
+    description: "How many follow-up messages were posted to keep the agent going."
+    value: ${{ steps.agent.outputs.nudges }}
   pr-url:
     description: "URL of the pull request, empty if none was created."
     value: ${{ steps.agent.outputs.pr-url }}
@@ -298,5 +305,6 @@ runs:
         POLL_TIMEOUT:         ${{ inputs.poll-timeout }}
         BUILD_TIMEOUT:        ${{ inputs.build-timeout }}
         FAIL_ON_NO_PR:        ${{ inputs.fail-on-no-pr }}
+        MAX_NUDGES:           ${{ inputs.max-nudges }}
         ACTION_PATH:          ${{ github.action_path }}
       run: bash "${{ github.action_path }}/coder-agent-issue.sh"

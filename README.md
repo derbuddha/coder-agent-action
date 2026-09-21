@@ -335,11 +335,12 @@ instead — the action will then never write to the repository on its own.
 | `stop-after` | `1h` | `1h` / `30m` / `90s` / `3600` / `now` / `off` |
 | `poll-timeout` / `build-timeout` | `2400` / `900` | seconds |
 | `fail-on-no-pr` | `true` | red job when no PR came out |
+| `max-nudges` | `3` | When the chat goes idle but the branch has not moved (the model ended its turn mid-task), post a "continue and run finish-issue.sh" message and keep polling — up to this many times. `0` = off |
 
 ## Outputs
 
 `chat-id`, `chat-url`, `workspace-id`, `workspace-url`, `branch`, `branch-url`,
-`pr-url`, `result` (`success` | `no-pr` | `failed` | `skipped`).
+`pr-url`, `nudges`, `result` (`success` | `no-pr` | `failed` | `skipped`).
 
 ## Migrating from `coder-create-task-action`
 

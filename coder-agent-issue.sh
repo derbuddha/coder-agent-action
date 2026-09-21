@@ -128,6 +128,11 @@ WS_NAME_PREFIX="${WS_NAME_PREFIX:-agent}"
 CODER_CHAT_PATH="${CODER_CHAT_PATH:-/agents/}"
 POLL_TIMEOUT="${POLL_TIMEOUT:-2400}"
 BUILD_TIMEOUT="${BUILD_TIMEOUT:-900}"
+# Some models end their turn mid-task (a reasoning-only reply, no tool call),
+# which Coder reports as `waiting` just like a finished run. When the chat goes
+# idle but the branch has not moved, post a follow-up telling the agent to
+# carry on — at most MAX_NUDGES times, then give up as before. 0 = off.
+MAX_NUDGES="${MAX_NUDGES:-3}"
 STOP_AFTER="${STOP_AFTER:-1h}"
 FAIL_ON_NO_PR="${FAIL_ON_NO_PR:-true}"
 RUN_ID="${RUN_ID:-${GITHUB_RUN_ID:-$(date +%s)}}"
@@ -686,20 +691,55 @@ issue_comment "🤖 Coder Agent started on this issue.
 
 🔗 $(link_html "$CHAT_URL" "Agent chat") · $(link_html "$WORKSPACE_URL" "Workspace")"
 
-echo "==> Polling chat (timeout ${POLL_TIMEOUT}s); waiting for running -> waiting"
-deadline=$(( $(date +%s) + POLL_TIMEOUT )); seen_active=0
+# Head of $BRANCH, empty when it does not exist. The branch can already be
+# there before the agent starts (finish-script bootstrap, an earlier run), so
+# "done" means the head MOVED, not merely that the branch exists.
+branch_sha() {
+  gitea_api GET "/repos/$REPO_OWNER/$REPO_NAME/branches/$BRANCH" 2>/dev/null \
+    | jq -r '.commit.id // empty' 2>/dev/null || true
+}
+BRANCH_SHA_BEFORE=$(branch_sha)
+
+NUDGE_TEXT="You stopped before finishing the task. The branch ${BRANCH} has not been pushed yet. \
+Continue implementing the issue from where you left off — make the edits, write the summary file, \
+and as your FINAL action run EXACTLY: bash ${REPO_DIR}/${FINISH_SCRIPT_PATH} \"${BRANCH}\" \"${COMMIT_MSG}\" \
+Do not stop until that command has run."
+
+echo "==> Polling chat (timeout ${POLL_TIMEOUT}s, max ${MAX_NUDGES} nudge(s)); waiting for running -> waiting"
+deadline=$(( $(date +%s) + POLL_TIMEOUT )); seen_active=0; nudges=0; nudged_at=0
 while :; do
   st=$(coder_api GET "/api/experimental/chats/$CHAT_ID" | jq -r '.status') \
     || die "Lost contact with Coder while polling the chat." "$CHAT_URL"
   echo "    chat status=$st"
   case "$st" in
-    pending|running|requires_action) seen_active=1 ;;
+    pending|running|requires_action|interrupting) seen_active=1; nudged_at=0 ;;
     error) echo "Agent reported an error."; FAIL=1; break ;;
-    waiting) [ "$seen_active" -eq 1 ] && { FAIL=0; break; } ;;
+    waiting)
+      # A nudged turn can start and finish between two polls; after 60s of
+      # uninterrupted `waiting`, judge it by the branch anyway.
+      [ "$nudged_at" -gt 0 ] && [ $(( $(date +%s) - nudged_at )) -ge 60 ] && seen_active=1
+      if [ "$seen_active" -eq 1 ]; then
+        sha=$(branch_sha)
+        if [ -n "$sha" ] && [ "$sha" != "$BRANCH_SHA_BEFORE" ]; then
+          FAIL=0; break
+        fi
+        if [ "$nudges" -ge "$MAX_NUDGES" ]; then
+          # Leave the verdict to the branch check below, as before nudging.
+          FAIL=0; break
+        fi
+        nudges=$((nudges + 1))
+        echo "    agent went idle without pushing $BRANCH — nudge ${nudges}/${MAX_NUDGES}"
+        coder_api POST "/api/experimental/chats/$CHAT_ID/messages" \
+          "$(jq -n --arg t "$NUDGE_TEXT" '{content: [{type: "text", text: $t}]}')" >/dev/null \
+          || { echo "    could not post the nudge; giving up on nudging"; FAIL=0; break; }
+        seen_active=0; nudged_at=$(date +%s)
+      fi
+      ;;
   esac
   [ "$(date +%s)" -ge "$deadline" ] && { echo "Agent timed out"; FAIL=1; break; }
   sleep 10
 done
+set_output nudges "$nudges"
 
 # --- 6. pull request ---------------------------------------------------------
 PR_URL=""
