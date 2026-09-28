@@ -109,7 +109,7 @@ inputs:
     description: >-
       Path the agent writes its 5-sentence change summary to. The action reads
       this file from the branch after the agent pushes and pastes it into the
-      PR description between "Automated by the Coder Agent." and "Refs #N".
+      PR description between "Automated by the Coder Agent." and "Closes #N".
       Empty = skip the summary lookup and omit the section.
     required: false
     default: ".gitea/agent-summary.md"
@@ -126,7 +126,7 @@ inputs:
       at `templates/PULL_REQUEST_TEMPLATE.yaml` and bootstraps it onto the
       work branch when missing from $BASE_BRANCH (same pattern as
       `bootstrap-finish-script`). If the file is found, the action
-      substitutes the agent's summary block (header + summary + refs + links)
+      substitutes the agent's summary block (header + summary + Closes #N + links)
       into the `<!-- AI_SUMMARY -->` marker. Empty = use the built-in PR
       body (legacy behaviour).
     required: false
@@ -145,11 +145,12 @@ inputs:
     default: "true"
   include-attachments:
     description: >-
-      Read the files uploaded to the issue and its comments and put them in the
-      prompt. Text attachments are inlined verbatim; binaries (images,
-      archives) and anything over the caps below are listed by name and size
-      only, since the workspace holds no Gitea token and cannot fetch them
-      itself. Set to `false` to skip the lookup entirely.
+      Read the files uploaded to the issue and its comments and hand them to
+      the agent. Text attachments are inlined into the prompt verbatim;
+      binaries (images, PDFs, archives) and text over the caps below are
+      committed to a temporary side branch the agent extracts outside its
+      clone (see attachment-push-max-bytes). Set to `false` to skip the lookup
+      entirely.
     required: false
     default: "true"
   attachment-max-bytes:
@@ -163,6 +164,21 @@ inputs:
       order (issue first, then comments) until the budget is spent.
     required: false
     default: "262144"
+  attachment-push-max-bytes:
+    description: >-
+      Per-file cap for an attachment that is not inlined but handed over as a
+      file: it is committed to `<branch>-attachments`, which the agent fetches
+      into attachment-workspace-dir, and that branch is deleted when the run
+      ends. Bigger files are listed by name only. `0` turns the hand-over off.
+    required: false
+    default: "10485760"
+  attachment-workspace-dir:
+    description: >-
+      Where the agent extracts the handed-over attachments inside the
+      workspace. Keep it outside the clone, or they end up in the PR.
+      Empty = /tmp/coder-agent-attachments/issue-<N>.
+    required: false
+    default: ""
   require-label:
     description: >-
       If set, the action exits early unless the issue currently carries this
@@ -187,9 +203,9 @@ inputs:
     required: false
     default: "1h"
   poll-timeout:
-    description: "Seconds to wait for the agent to go running -> waiting."
+    description: "Seconds to wait for the agent to go running -> waiting. On timeout the chat is interrupted and the workspace stopped."
     required: false
-    default: "2400"
+    default: "3600"
   build-timeout:
     description: "Seconds to wait for the workspace build to reach running."
     required: false
@@ -299,6 +315,8 @@ runs:
         INCLUDE_ATTACHMENTS:  ${{ inputs.include-attachments }}
         ATTACHMENT_MAX_BYTES: ${{ inputs.attachment-max-bytes }}
         ATTACHMENT_TOTAL_BYTES: ${{ inputs.attachment-total-bytes }}
+        ATTACHMENT_PUSH_MAX_BYTES: ${{ inputs.attachment-push-max-bytes }}
+        WS_ATTACHMENT_DIR:    ${{ inputs.attachment-workspace-dir }}
         REQUIRE_LABEL:        ${{ inputs.require-label }}
         REMOVE_LABEL:         ${{ inputs.remove-label }}
         STOP_AFTER:           ${{ inputs.stop-after }}

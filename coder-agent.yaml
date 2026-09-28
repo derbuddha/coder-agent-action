@@ -12,9 +12,7 @@ name: Coder Agent on Issue
 # before the job starts and cannot take a token — an open upstream limitation
 # (go-gitea/gitea#26032, #27935), not something a syntax change fixes. So we
 # fetch the action with an action: actions/checkout can clone ANY repo on this
-# instance when given `repository` + `token`. No hand-rolled clone script.
-# If your action repo IS public, the shorter `uses:` form is commented out at
-# the bottom of the first job.
+# instance when given `repository` + `token`, and then call it by local path.
 #
 # Token: the automatic per-job token is minted for THIS repository and will be
 # refused on the action repo, so ACTION_CLONE_TOKEN carries the fetch and the
@@ -24,6 +22,11 @@ name: Coder Agent on Issue
 #   a PAT with read:repository scope, from an account that can see the action
 #   repo. Set it ONCE on the org so every repo inherits it.
 #   Gitea rejects secret names starting with GITEA_ or GITHUB_.
+#
+# MM_WEBHOOK_URL:
+#   Mattermost incoming webhook. Set on the org too, as secret (preferred)
+#   or variable; the secret wins if both exist. Without it the notify
+#   steps simply post nothing (the action soft-fails by design).
 
 run-name: "Coder Agent · issue #${{ gitea.event.issue.number }} — ${{ gitea.event.issue.title }}"
 
@@ -38,10 +41,10 @@ permissions:
 
 jobs:
   # One job per label: to wire a second label to another template or model,
-  # copy this job, change the label in `if:` and point AGENT_TEMPLATE at its
-  # own variable (e.g. vars.AGENT_TEMPLATE_CLAUDE).
+  # copy this job, change the label in `if:` and point coder-template-name at
+  # its own variable (e.g. vars.AGENT_TEMPLATE_CLAUDE).
   agent:
-    runs-on: ubuntu-noble
+    runs-on: ubuntu-24.04
     # Gitea maps `labeled` to action `label_updated`; the added label's name is
     # in changes.added_labels[0] (empty on unrelated events, so they skip).
     if: ${{ gitea.event.action == 'label_updated' && gitea.event.changes.added_labels[0].name == 'coder-agent' }}
@@ -51,7 +54,8 @@ jobs:
         # actions/checkout (pull-mirrored from GitHub) regardless of the
         # instance's [actions] DEFAULT_ACTIONS_URL. A bare `actions/checkout@v4`
         # resolves to github.com unless that is set to `self` — an internet call
-        # you may not want.
+        # you may not want. (No local mirror? The README does the same fetch as
+        # a plain git-clone script.)
         uses: https://gitea.example.com/actions/checkout@v4
         with:
           repository: gitea/coder-agent-action
@@ -65,57 +69,66 @@ jobs:
           # a subpath — go-gitea/gitea#33629):
           # github-server-url: https://gitea.example.com
 
+      - name: Fetch the notify action
+        uses: https://gitea.example.com/actions/checkout@v4
+        with:
+          repository: gitea/notify-workflow-action
+          ref: main
+          token: ${{ secrets.ACTION_CLONE_TOKEN || secrets.GITEA_TOKEN }}
+          path: .actions/notify-workflow-action
+          persist-credentials: false
+
+      - name: Notify start
+        uses: ./.actions/notify-workflow-action
+        with:
+          webhook_url: ${{ secrets.MM_WEBHOOK_URL || vars.MM_WEBHOOK_URL }}
+          status: info
+          title: "Coder Agent gestartet · ${{ gitea.repository }} #${{ gitea.event.issue.number }}"
+          text: ${{ gitea.event.issue.title }}
+          link: ${{ gitea.event.issue.html_url }}
+          no_proxy: ${{ vars.INTERNAL_NO_PROXY }}
+
+      # Called by local path: `uses:` cannot fetch the private action repo
+      # itself (see above), but a path that already exists in the workspace is
+      # resolved without any network call. This is what buys us the action's
+      # outputs — pr-url below — which the previous `run: bash ...` form could
+      # not expose.
       - name: Run Coder Agent on this issue
-        env:
-          CODER_URL:           ${{ vars.CODER_URL }}
-          CODER_SESSION_TOKEN: ${{ secrets.CODER_TOKEN }}
-          CODER_ORG:           ${{ vars.CODER_ORG }}
+        id: agent
+        uses: ./.action
+        with:
+          coder-url:            ${{ vars.CODER_URL }}
+          coder-token:          ${{ secrets.CODER_TOKEN }}
+          coder-organization:   ${{ vars.CODER_ORG_ID }}
           # Template name comes from the repo (or org) variable, so switching
           # templates is a settings change, not a commit.
-          AGENT_TEMPLATE:      ${{ vars.AGENT_TEMPLATE }}
+          coder-template-name:  ${{ vars.AGENT_TEMPLATE }}
           # Optional: pin a model by name (empty = deployment default).
-          AGENT_MODEL:         ${{ vars.AGENT_MODEL }}
-          FORGE_TOKEN:         ${{ secrets.GITEA_TOKEN }}   # automatic per-job token
-          STOP_AFTER:          "1h"    # keep the workspace for debugging
-          # The agent writes its 5-sentence change summary to
-          # .gitea/agent-summary.md (the action's built-in default). The action
-          # reads that file back from the branch and pastes it into the PR
-          # description. Set SUMMARY_PATH here only to override the path.
-          # Issue attachments go into the prompt (text inlined, binaries listed).
-          # Raise the caps for repos whose issues carry big specs or logs, or set
-          # INCLUDE_ATTACHMENTS: "false" to skip the lookup:
-          # ATTACHMENT_MAX_BYTES:   "262144"
-          # ATTACHMENT_TOTAL_BYTES: "1048576"
+          coder-model:          ${{ vars.AGENT_MODEL }}
+          gitea-token:          ${{ secrets.GITEA_TOKEN }}   # automatic per-job token
+          stop-after:           "1h"                         # keep the workspace for debugging
+          # The PR body always carries `Closes #<issue>`, so merging the PR
+          # closes the issue — Gitea does that itself, no extra permission.
           # The clone URL comes from the repo's own ssh_url. Only set these if
           # the clone inside the workspace fails — the log prints the URL it
           # used just before creating the workspace:
-          # GITEA_SSH_HOST:    git-ssh.example.com
-          # GITEA_SSH_PORT:    "2222"
-        # Flat layout: the script sits at the root of the action repo. curl and
-        # jq come from the composite wrapper we skipped, so check them here.
-        run: |
-          set -euo pipefail
-          need=""
-          command -v curl >/dev/null || need="$need curl"
-          command -v jq   >/dev/null || need="$need jq"
-          [ -z "$need" ] || { apt-get update -qq && apt-get install -y -qq $need; }
-          bash "$GITHUB_WORKSPACE/.action/coder-agent-issue.sh"
+          # gitea-ssh-host:     git-ssh.example.com
+          # gitea-ssh-port:     "2222"
 
-      # --- PUBLIC ACTION REPO? ------------------------------------------------
-      # Then the two steps above collapse into this one — no checkout, no PAT,
-      # and inputs instead of env vars (see action.yaml for the full list).
-      #
-      # - name: Coder Agent
-      #   id: agent
-      #   uses: https://gitea.example.com/gitea/coder-agent-action.git@main
-      #   with:
-      #     coder-url:           ${{ vars.CODER_URL }}
-      #     coder-token:         ${{ secrets.CODER_TOKEN }}
-      #     coder-organization:  ${{ vars.CODER_ORG }}
-      #     coder-template-name: ${{ vars.AGENT_TEMPLATE }}
-      #     coder-model:         ${{ vars.AGENT_MODEL }}
-      #     gitea-token:         ${{ secrets.GITEA_TOKEN }}
-      #     stop-after:          "1h"
-      #     summary-path:        ".gitea/agent-summary.md"
-      #     # gitea-ssh-host:    git-ssh.example.com
-      #     # gitea-ssh-port:    "2222"
+      # always(): this must also run when the agent step failed — that is the
+      # message you actually want. job.status carries success/failure through.
+      - name: Notify result
+        if: always()
+        uses: ./.actions/notify-workflow-action
+        with:
+          webhook_url: ${{ secrets.MM_WEBHOOK_URL || vars.MM_WEBHOOK_URL }}
+          status: ${{ job.status }}
+          title: "Coder Agent ${{ job.status }} · ${{ gitea.repository }} #${{ gitea.event.issue.number }}"
+          text: ${{ gitea.event.issue.title }}
+          # Falls back to the issue when no PR was opened (failure, or no-pr).
+          link: ${{ steps.agent.outputs.pr-url || gitea.event.issue.html_url }}
+          fields: >-
+            [{"title":"Ergebnis","value":"${{ steps.agent.outputs.result || 'abgebrochen' }}","short":true},
+             {"title":"Branch","value":"${{ steps.agent.outputs.branch || '—' }}","short":true}]
+          footer: "Chat: ${{ steps.agent.outputs.chat-url }}"
+          no_proxy: ${{ vars.INTERNAL_NO_PROXY }}

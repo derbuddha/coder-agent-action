@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Please fill in all fields. The agent fills in the AI summary.
+        Fill in the fields below — the agent fills in the AI summary.
     visible: [form]
 
   - type: checkboxes
@@ -19,35 +19,42 @@ body:
         - label: Refactor / Chore
         - label: AI Agent
 
+  - type: input
+    id: summary
+    attributes:
+      label: Summary
+      description: One-line summary of what you changed and why. (Minimum 20 characters.)
+      placeholder: e.g. rewrote the retry logic and dropped an unused helper.
+    validations:
+      required: true
+      # Go regexp. "." matches one rune, so umlauts count as one character.
+      regex: "^.{20,}$"
+
+  - type: textarea
+    id: detailed-changes
+    attributes:
+      label: Detail Changes
+      description: Bullet list of what you changed and why.
+      placeholder: |
+        - Rewrote the retry logic to handle network timeouts
+        - Renamed `foo` to `bar` for clarity
+        - Removed `unusedHelper()` — no caller referenced it
+      value: "- "
+    validations:
+      required: true
+
   - type: textarea
     id: ai-summary
     attributes:
       label: AI - Summary
-      description: Brief description of the change, motivation and impact.
+      description: Brief description of the change, its motivation, and impact — written by the AI agent.
       placeholder: Filled in by the agent.
       # Marker the Coder Agent action looks for to substitute its summary
-      # block (header + summary + Refs #N + links). Leave it in place.
+      # block (header + summary + Closes #N + links). Leave it in place.
       value: |
         <!-- AI_SUMMARY -->
     validations:
       required: false
-
-  - type: textarea
-    id: human-summary
-    attributes:
-      label: Human - Summary
-      description: What you changed by hand on top of (or instead of) the agent's work, and why.
-      placeholder: e.g. rewrote the retry logic the agent generated, adjusted naming, dropped an unused helper.
-    validations:
-      required: false
-
-  - type: textarea
-    id: changes
-    attributes:
-      label: Changes
-      value: "- "
-    validations:
-      required: true
 
   - type: checkboxes
     id: checklist

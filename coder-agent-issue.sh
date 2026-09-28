@@ -83,13 +83,22 @@ COMMENT_ON_ISSUE="${COMMENT_ON_ISSUE:-true}"
 INCLUDE_ATTACHMENTS="${INCLUDE_ATTACHMENTS:-true}"
 ATTACHMENT_MAX_BYTES="${ATTACHMENT_MAX_BYTES:-65536}"
 ATTACHMENT_TOTAL_BYTES="${ATTACHMENT_TOTAL_BYTES:-262144}"
+# What can't be inlined (images, PDFs, big logs) is handed over as files: the
+# runner commits them to a throwaway side branch and the agent extracts that
+# into WS_ATTACHMENT_DIR — outside the clone, so nothing lands in the PR. The
+# side branch is deleted when the run ends. Per-file cap; 0 = off.
+ATTACHMENT_PUSH_MAX_BYTES="${ATTACHMENT_PUSH_MAX_BYTES:-10485760}"
+ATT_BRANCH_SUFFIX="${ATT_BRANCH_SUFFIX:--attachments}"
+ATT_BRANCH_SUBDIR=".issue-attachments"
+ATT_BRANCH="${BRANCH}${ATT_BRANCH_SUFFIX}"
+WS_ATTACHMENT_DIR="${WS_ATTACHMENT_DIR:-/tmp/coder-agent-attachments/issue-${ISSUE_NUM}}"
 # Comment paging. Gitea caps `limit` at MAX_RESPONSE_ITEMS (50 by default), so
 # the fetch below walks pages until one comes back short.
 COMMENT_PAGE_SIZE="${COMMENT_PAGE_SIZE:-50}"
 COMMENT_MAX_PAGES="${COMMENT_MAX_PAGES:-20}"
 # Path the agent writes its 5-sentence change summary to. The action reads this
 # from the branch after the agent pushes and pastes it into the PR body
-# between "Automated by the Coder Agent." and "Refs #N". Empty = skip.
+# between "Automated by the Coder Agent." and "Closes #N". Empty = skip.
 SUMMARY_PATH="${SUMMARY_PATH:-.gitea/agent-summary.md}"
 # Opt-in PR-template support. PR_TEMPLATE_PATH is the repo path of the template
 # (e.g. `.gitea/PULL_REQUEST_TEMPLATE.md` or `.gitea/pull_request_template.yaml`).
@@ -126,7 +135,7 @@ SECTION_END="${SECTION_END:-<!-- agent:end -->}"
 GIT_REPO_PARAM="${GIT_REPO_PARAM:-git_repo_url}"
 WS_NAME_PREFIX="${WS_NAME_PREFIX:-agent}"
 CODER_CHAT_PATH="${CODER_CHAT_PATH:-/agents/}"
-POLL_TIMEOUT="${POLL_TIMEOUT:-2400}"
+POLL_TIMEOUT="${POLL_TIMEOUT:-3600}"
 BUILD_TIMEOUT="${BUILD_TIMEOUT:-900}"
 # Some models end their turn mid-task (a reasoning-only reply, no tool call),
 # which Coder reports as `waiting` just like a finished run. When the chat goes
@@ -146,8 +155,12 @@ RUN_ID="${RUN_ID:-${GITHUB_RUN_ID:-$(date +%s)}}"
 api_call() { # label url auth-header method path [body]
   local label="$1" base="$2" auth="$3" m="$4" p="$5" b="${6:-}" resp code body
   if [ -n "$b" ]; then
+    # A body of "@<file>" is sent from that file: attachment uploads run to
+    # megabytes, far past the 128 KiB Linux allows a single argument.
+    local data=(-d "$b")
+    case "$b" in @*) data=(--data-binary "$b") ;; esac
     resp=$(curl -sS -w $'\n%{http_code}' -X "$m" "$base$p" \
-      -H "$auth" -H "Content-Type: application/json" -d "$b" 2>&1) || resp=$'\n000'
+      -H "$auth" -H "Content-Type: application/json" "${data[@]}" 2>&1) || resp=$'\n000'
   else
     resp=$(curl -sS -w $'\n%{http_code}' -X "$m" "$base$p" -H "$auth" 2>&1) || resp=$'\n000'
   fi
@@ -190,6 +203,18 @@ gitea_download() { # url outfile max-bytes
   curl -fsSL --max-time 60 --max-filesize "$3" \
     -H "Authorization: token $GITEA_TOKEN" -o "$2" "$1" 2>/dev/null
 }
+# The attachments side branch only has to live until the agent has fetched it;
+# called once the chat goes idle and again from the exit trap. Best effort.
+drop_att_branch() {
+  [ "$ATT_BRANCH_CREATED" = true ] || return 0
+  if gitea_api DELETE "/repos/$REPO_OWNER/$REPO_NAME/branches/$ATT_BRANCH" >/dev/null 2>&1; then
+    echo "==> Deleted attachments branch $ATT_BRANCH"
+  else
+    echo "!! Could not delete attachments branch $ATT_BRANCH — delete it by hand."
+  fi
+  ATT_BRANCH_CREATED=false
+  : > "$API_ERR_FILE"  # not the run's failure reason
+}
 # A NUL byte is the cheap, portable "don't paste this into a prompt" test: it
 # catches images, archives and compiled blobs without an extension allowlist.
 is_binary() { # file
@@ -226,7 +251,11 @@ set_output() { # name value
 # thing with a reason attached; a failure that never calls it still gets
 # reported, just with the script line instead of a sentence.
 LAST_API_ERROR=""; FAIL_REASON=""; FAIL_HINT=""; FAIL_LINE=""; REPORTED=false
-ATT_TMPDIR=""
+# AGENT_LIVE: a chat was started and is not idle (waiting/error) yet.
+# WS_HALTED:  halt_agent already stopped the workspace (step 7 then skips).
+# CAUGHT_SIGNAL: the runner cancelled the job (timeout-minutes, manual cancel).
+AGENT_LIVE=false; WS_HALTED=false; CAUGHT_SIGNAL=""
+ATT_TMPDIR=""; ATT_BRANCH_CREATED=false
 API_ERR_FILE=$(mktemp "${TMPDIR:-/tmp}/coder-agent-api-err.XXXXXX")
 
 die() { # reason [hint]
@@ -236,9 +265,45 @@ die() { # reason [hint]
   exit 1
 }
 
+# The same as pressing the stop button in the Coder UI, plus stopping the
+# workspace so nothing the agent already queued can still commit or push.
+# Chats moved from /api/experimental to /api/v2 in later Coder releases, so
+# try both. Best effort throughout: this also runs from the exit trap.
+halt_agent() { # why
+  echo "==> Stopping the agent ($1)"
+  if [ -n "${CHAT_ID:-}" ]; then
+    if coder_api POST "/api/experimental/chats/$CHAT_ID/interrupt" >/dev/null 2>&1       || coder_api POST "/api/v2/chats/$CHAT_ID/interrupt" >/dev/null 2>&1; then
+      echo "    chat interrupted"
+    else
+      echo "!! Could not interrupt the chat — stop it by hand: $CHAT_URL"
+    fi
+  fi
+  if [ -n "${WORKSPACE_ID:-}" ]; then
+    if coder_api POST "/api/v2/workspaces/$WORKSPACE_ID/builds" '{"transition":"stop"}'          >/dev/null 2>&1; then
+      echo "    workspace stop queued"
+    else
+      echo "!! Could not stop the workspace — stop it by hand: $WORKSPACE_URL"
+    fi
+  fi
+  AGENT_LIVE=false; WS_HALTED=true
+  : > "$API_ERR_FILE"  # a failed best-effort call is not the run's failure reason
+}
+
 on_exit() {
   local code=$? reason="" links=""
+  # Cancelled or aborted mid-run: don't leave an agent working on a job nobody
+  # watches. A cancel during the build has no chat yet, but its workspace would
+  # never get the stop-after deadline either.
+  if [ "$AGENT_LIVE" = true ] || { [ -n "$CAUGHT_SIGNAL" ] && [ "$WS_HALTED" != true ]; }; then
+    if [ -n "$CAUGHT_SIGNAL" ]; then
+      halt_agent "job cancelled ($CAUGHT_SIGNAL)" || true
+      [ -n "$FAIL_REASON" ]         || FAIL_REASON="The job was cancelled ($CAUGHT_SIGNAL) — the agent and its workspace were stopped."
+    else
+      halt_agent "run aborted" || true
+    fi
+  fi
   LAST_API_ERROR=$(cat "$API_ERR_FILE" 2>/dev/null || true)
+  drop_att_branch || true
   rm -f "$API_ERR_FILE"
   if [ -n "${ATT_TMPDIR:-}" ]; then rm -rf "$ATT_TMPDIR"; fi
   if [ "$code" -eq 0 ]; then return 0; fi
@@ -284,6 +349,10 @@ ${links}}"
 }
 trap 'FAIL_LINE=$LINENO' ERR
 trap on_exit EXIT
+# Without these, a cancel kills bash before the EXIT trap can clean up.
+trap 'CAUGHT_SIGNAL=SIGTERM; exit 143' TERM
+trap 'CAUGHT_SIGNAL=SIGINT;  exit 130' INT
+trap 'CAUGHT_SIGNAL=SIGHUP;  exit 129' HUP
 
 echo "==> Repo ${REPO_OWNER}/${REPO_NAME}  issue #${ISSUE_NUM}  branch ${BRANCH}"
 
@@ -532,42 +601,107 @@ if [ "$INCLUDE_ATTACHMENTS" = "true" ]; then
           origin: ("a comment by @" + ($c.user.login // "unknown")) } ]'
     } | jq -c -s 'add // []' 2>/dev/null ) || ALL_ASSETS='[]'
 
-  ATT_LIST=""; ATT_BODIES=""; ATT_USED=0
+  ATT_BODIES=""; ATT_USED=0; ATT_PUSHED=0
+  # One entry per file; a pushed file's note is only settled once the side
+  # branch exists, so the list is rendered after the loop.
+  ATT_NAMES=(); ATT_NOTES=(); ATT_URLS=(); ATT_STAGED=()
   ATT_TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/coder-agent-att.XXXXXX")
+  mkdir -p "$ATT_TMPDIR/stage"
+  # Download up to whichever cap is bigger: inline or push.
+  fetch_cap=$ATTACHMENT_MAX_BYTES
+  [ "$ATTACHMENT_PUSH_MAX_BYTES" -gt "$fetch_cap" ] && fetch_cap=$ATTACHMENT_PUSH_MAX_BYTES
+  idx=0
   while IFS= read -r a; do
     [ -n "$a" ] || continue
+    idx=$((idx + 1))
     aname=$(printf '%s' "$a" | jq -r '.name')
     asize=$(printf '%s' "$a" | jq -r '.size | floor? // 0')
     aurl=$(printf '%s' "$a"  | jq -r '.url')
     aorigin=$(printf '%s' "$a" | jq -r '.origin')
-    note=""
+    # Numbered: pasted screenshots are all called image.png.
+    safe=$(printf '%02d-%s' "$idx" "$(printf '%s' "$aname" | tr -c 'A-Za-z0-9._-' '_')")
+    afile="$ATT_TMPDIR/$safe"
+    note=""; staged=""
     if [ -z "$aurl" ]; then
-      note="no download URL — not inlined"
-    elif [ "$asize" -gt "$ATTACHMENT_MAX_BYTES" ]; then
-      note="over the $(human_size "$ATTACHMENT_MAX_BYTES") per-file cap — not inlined"
-    elif [ $((ATT_USED + asize)) -gt "$ATTACHMENT_TOTAL_BYTES" ]; then
-      note="the $(human_size "$ATTACHMENT_TOTAL_BYTES") total inline budget is spent — not inlined"
+      note="no download URL — not available"
+    elif [ "$asize" -gt "$fetch_cap" ]; then
+      note="over the $(human_size "$fetch_cap") cap — not available"
+    elif ! gitea_download "$aurl" "$afile" "$fetch_cap"; then
+      note="could not be downloaded — not available"
     else
-      afile="$ATT_TMPDIR/$(printf '%s' "$aname" | tr -c 'A-Za-z0-9._-' '_')"
-      if ! gitea_download "$aurl" "$afile" "$ATTACHMENT_MAX_BYTES"; then
-        note="could not be downloaded — not inlined"
-      elif is_binary "$afile"; then
-        note="binary — not inlined, you cannot open it"
-      else
-        ATT_USED=$((ATT_USED + $(wc -c < "$afile" | tr -d ' ')))
+      fsize=$(wc -c < "$afile" | tr -d ' ')
+      why=""
+      if is_binary "$afile"; then
+        why="binary"
+      elif [ "$fsize" -gt "$ATTACHMENT_MAX_BYTES" ]; then
+        why="over the $(human_size "$ATTACHMENT_MAX_BYTES") inline cap"
+      elif [ $((ATT_USED + fsize)) -gt "$ATTACHMENT_TOTAL_BYTES" ]; then
+        why="the $(human_size "$ATTACHMENT_TOTAL_BYTES") total inline budget is spent"
+      fi
+      if [ -z "$why" ]; then
+        ATT_USED=$((ATT_USED + fsize))
         note="inlined below"
         ATT_BODIES="${ATT_BODIES}
 ===== BEGIN ATTACHMENT ${aname} (from ${aorigin}) =====
 $(cat "$afile")
 ===== END ATTACHMENT ${aname} =====
 "
+      elif [ "$fsize" -le "$ATTACHMENT_PUSH_MAX_BYTES" ]; then
+        mv "$afile" "$ATT_TMPDIR/stage/$safe"
+        staged="$safe"
+        note="${why} — not inlined"   # settled after the push
+      else
+        note="${why}, and over the $(human_size "$ATTACHMENT_PUSH_MAX_BYTES") file cap — not available"
       fi
     fi
-    echo "    ${aname} ($(human_size "$asize"), ${aorigin}) — ${note}"
-    ATT_LIST="${ATT_LIST}- ${aname} ($(human_size "$asize"), from ${aorigin}) — ${note}${aurl:+
-  ${aurl}}
-"
+    ATT_NAMES+=("${aname} ($(human_size "$asize"), from ${aorigin})")
+    ATT_NOTES+=("$note"); ATT_URLS+=("$aurl"); ATT_STAGED+=("$staged")
   done <<<"$(printf '%s' "$ALL_ASSETS" | jq -c '.[]?')"
+
+  # --- hand the non-inlined files over via a side branch ---------------------
+  # One commit through the multi-file contents API (Gitea >= 1.20), built in a
+  # file because the base64 runs to megabytes. A stale branch from an earlier
+  # run of this issue is dropped first so the commit starts clean.
+  if [ -n "$(ls -A "$ATT_TMPDIR/stage")" ]; then
+    echo "==> Pushing $(ls -A "$ATT_TMPDIR/stage" | wc -l | tr -d ' ') attachment(s) to $ATT_BRANCH"
+    gitea_api DELETE "/repos/$REPO_OWNER/$REPO_NAME/branches/$ATT_BRANCH" >/dev/null 2>&1 || true
+    : > "$ATT_TMPDIR/files.jsonl"
+    for f in "$ATT_TMPDIR/stage"/*; do
+      base64 -w0 < "$f" 2>/dev/null > "$ATT_TMPDIR/b64" || base64 < "$f" | tr -d '\n' > "$ATT_TMPDIR/b64"
+      jq -nc --rawfile c "$ATT_TMPDIR/b64" --arg p "$ATT_BRANCH_SUBDIR/$(basename "$f")" \
+        '{operation:"create", path:$p, content:$c}' >> "$ATT_TMPDIR/files.jsonl"
+    done
+    # [skip ci]: the side branch is not code, don't let push workflows run on it.
+    jq -s --arg base "$BASE_BRANCH" --arg nb "$ATT_BRANCH" \
+      --arg msg "chore: attachments of issue #${ISSUE_NUM} for the Coder Agent [skip ci]" \
+      '{branch:$base, new_branch:$nb, message:$msg, files:.}' \
+      "$ATT_TMPDIR/files.jsonl" > "$ATT_TMPDIR/body.json"
+    if gitea_api POST "/repos/$REPO_OWNER/$REPO_NAME/contents" "@$ATT_TMPDIR/body.json" >/dev/null; then
+      ATT_BRANCH_CREATED=true
+      echo "    committed to $ATT_BRANCH (deleted again when the run ends)"
+    else
+      # Best effort: the agent still gets names and sizes, as before.
+      echo "!! Could not push the attachments — the agent only gets their names."
+      : > "$API_ERR_FILE"
+    fi
+  fi
+
+  ATT_LIST=""
+  for i in "${!ATT_NAMES[@]}"; do
+    note="${ATT_NOTES[$i]}"
+    if [ -n "${ATT_STAGED[$i]}" ]; then
+      if [ "$ATT_BRANCH_CREATED" = true ]; then
+        note="${note}, saved as ${WS_ATTACHMENT_DIR}/${ATT_STAGED[$i]}"
+        ATT_PUSHED=$((ATT_PUSHED + 1))
+      else
+        note="${note}, not available"
+      fi
+    fi
+    echo "    ${ATT_NAMES[$i]} — ${note}"
+    ATT_LIST="${ATT_LIST}- ${ATT_NAMES[$i]} — ${note}${ATT_URLS[$i]:+
+  ${ATT_URLS[$i]}}
+"
+  done
   rm -rf "$ATT_TMPDIR"; ATT_TMPDIR=""
 
   if [ -n "$ATT_LIST" ]; then IATTACH="${ATT_LIST}${ATT_BODIES}"; fi
@@ -584,6 +718,20 @@ if [ "$NEED_BRANCH_CHECKOUT" = "true" ]; then
     cd ${REPO_DIR} && git fetch origin ${BRANCH} && git checkout ${BRANCH}
 "
 fi
+if [ "${ATT_PUSHED:-0}" -gt 0 ]; then
+  # Extracted OUTSIDE the clone, so finish-issue.sh's `git add -A` can't pick
+  # the files up; the side branch itself is deleted after the run.
+  CHECKOUT_STEP="${CHECKOUT_STEP}- Before you start on the issue, run this EXACT command once to fetch the
+  attachments marked \"saved as\" below into ${WS_ATTACHMENT_DIR}:
+    mkdir -p ${WS_ATTACHMENT_DIR} && git -C ${REPO_DIR} fetch origin ${ATT_BRANCH} && git -C ${REPO_DIR} archive FETCH_HEAD:${ATT_BRANCH_SUBDIR} | tar -x -C ${WS_ATTACHMENT_DIR}
+  Then open the files that matter — look at screenshots and images, they often
+  carry the actual requirement. By default, do not copy them into the
+  repository — they are reference material. Exception: if the issue asks for
+  an attachment to become part of the project (e.g. \"add the image\", a logo,
+  a photo for a page), copy exactly those files to the right place, following
+  the project's conventions for location, file name and format.
+"
+fi
 
 read -r -d '' PROMPT <<TXT || true
 You are working in a checked-out clone of ${REPO_OWNER}/${REPO_NAME} located at
@@ -598,10 +746,11 @@ Comments on the issue, oldest first:
 ${ICOMMENTS}
 }${IATTACH:+
 Attachments uploaded to the issue or its comments. Text files are reproduced
-in full between the BEGIN/END markers below; anything binary or too large is
-listed by name only — you cannot open those, and their URLs need a Gitea
-login, so work from what the issue text says about them and say so in your
-summary if something you needed was unreadable:
+in full between the BEGIN/END markers below. Files marked "saved as" are
+fetched into the workspace by an instruction further down. Files marked
+"not available" cannot be opened — their URLs need a Gitea login — so work
+from what the issue text says about them and say so in your summary if
+something you needed was unreadable:
 
 ${IATTACH}
 }
@@ -667,7 +816,7 @@ while :; do
   [ "$(date +%s)" -ge "$deadline" ] \
     && die "The workspace build did not reach 'running' within ${BUILD_TIMEOUT}s." \
            "Raise \`build-timeout\`, or check the provisioner on $CODER_URL."
-  sleep 8
+  sleep 8 & wait $!
 done
 
 # --- 5. chat -----------------------------------------------------------------
@@ -685,6 +834,7 @@ echo "    chat_id=$CHAT_ID"
 echo "    chat_url=$CHAT_URL"
 set_output chat-id "$CHAT_ID"
 set_output chat-url "$CHAT_URL"
+AGENT_LIVE=true
 
 # Post the live links right away, so the run can be followed while it happens.
 issue_comment "🤖 Coder Agent started on this issue.
@@ -706,7 +856,7 @@ and as your FINAL action run EXACTLY: bash ${REPO_DIR}/${FINISH_SCRIPT_PATH} \"$
 Do not stop until that command has run."
 
 echo "==> Polling chat (timeout ${POLL_TIMEOUT}s, max ${MAX_NUDGES} nudge(s)); waiting for running -> waiting"
-deadline=$(( $(date +%s) + POLL_TIMEOUT )); seen_active=0; nudges=0; nudged_at=0
+deadline=$(( $(date +%s) + POLL_TIMEOUT )); seen_active=0; nudges=0; nudged_at=0; TIMED_OUT=false
 while :; do
   st=$(coder_api GET "/api/experimental/chats/$CHAT_ID" | jq -r '.status') \
     || die "Lost contact with Coder while polling the chat." "$CHAT_URL"
@@ -736,9 +886,18 @@ while :; do
       fi
       ;;
   esac
-  [ "$(date +%s)" -ge "$deadline" ] && { echo "Agent timed out"; FAIL=1; break; }
-  sleep 10
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    echo "Agent timed out after ${POLL_TIMEOUT}s"
+    FAIL=1; TIMED_OUT=true
+    halt_agent "poll-timeout reached"
+    break
+  fi
+  # Backgrounded so a cancel signal is handled now, not after the sleep.
+  sleep 10 & wait $!
 done
+# Every other way out of the loop leaves the chat idle (waiting or error).
+AGENT_LIVE=false
+drop_att_branch
 set_output nudges "$nudges"
 
 # --- 6. pull request ---------------------------------------------------------
@@ -758,7 +917,7 @@ if [ "${FAIL:-1}" -eq 0 ]; then
     PR_LINKS="🔗 $(link_html "$CHAT_URL" "Agent chat") · $(link_html "$WORKSPACE_URL" "Workspace") · $(link_html "$BRANCH_URL" "Branch")"
 
     # Read the agent's 5-sentence change summary back from the branch, so the
-    # PR description carries it between "Coder Agent." and "Refs #N". Best
+    # PR description carries it between "Coder Agent." and "Closes #N". Best
     # effort: a missing file is normal on a bootstrap commit (finish-issue.sh
     # only, no agent work yet) — fall back to a one-liner so reviewers still
     # see *something* happened and don't mistake the PR for an empty run.
@@ -783,7 +942,7 @@ if [ "${FAIL:-1}" -eq 0 ]; then
 
 ${AGENT_SUMMARY}
 
-Refs #${ISSUE_NUM}
+Closes #${ISSUE_NUM}
 
 ${PR_LINKS}"
 
@@ -1000,7 +1159,7 @@ PY
           body: (  "Automated by the Coder Agent.\n\n"
                  + "📝 **Summary**\n\n"
                  + $sum + "\n\n"
-                 + "Refs #" + $n + "\n\n"
+                 + "Closes #" + $n + "\n\n"
                  + $links) }')
     fi
 
@@ -1038,6 +1197,8 @@ if [ -n "$PR_URL" ]; then
   RESULT="success"; MSG="🤖 Coder Agent opened a PR: $PR_URL"
 elif [ "${FAIL:-1}" -eq 0 ]; then
   RESULT="no-pr"; MSG="🤖 Coder Agent finished but no PR was created — branch \`$BRANCH\` may be missing."
+elif [ "$TIMED_OUT" = true ]; then
+  RESULT="failed"; MSG="⏱️ Coder Agent did not finish within ${POLL_TIMEOUT}s — it was stopped. Open the chat to see how far it got."
 else
   RESULT="failed"; MSG="⚠️ Coder Agent did not complete. Open the chat to see what happened."
 fi
@@ -1080,7 +1241,9 @@ case "$STOP_AFTER" in
   *)  stop_secs=$STOP_AFTER ;;
 esac
 
-if [ "$stop_secs" -eq 0 ] 2>/dev/null; then
+if [ "$WS_HALTED" = true ]; then
+  echo "==> Workspace already stopped with the agent — skipping stop-after"
+elif [ "$stop_secs" -eq 0 ] 2>/dev/null; then
   echo "==> Stopping the workspace now"
   coder_api POST "/api/v2/workspaces/$WORKSPACE_ID/builds" '{"transition":"stop"}' >/dev/null || true
 elif [ "$stop_secs" -gt 0 ] 2>/dev/null; then

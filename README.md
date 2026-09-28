@@ -177,8 +177,9 @@ vars, and no PAT:
    issue's Branch/Tag sidebar field to that branch, and comments the result.
    Re-labelling an issue whose PR is already open refreshes that PR's body
    with the current run's links instead of leaving stale ones. The PR body
-   is built as `Automated by the Coder Agent.` → `📝 **Summary**` → `Refs #N`
-   → link bar; the **Summary** section is the agent's own 5-sentence change
+   is built as `Automated by the Coder Agent.` → `📝 **Summary**` → `Closes #N`
+   → link bar. `Closes #N` makes Gitea close the issue when the PR is
+   merged (the commit message only says `refs #N`); the **Summary** section is the agent's own 5-sentence change
    summary, read back from `.gitea/agent-summary.md` on the branch (path is
    `summary-path`, empty = skip). The agent is told in its prompt to write
    exactly five sentences — goal, what changed, verification, caveats —
@@ -210,17 +211,29 @@ default on):
 | Attachment | What the agent gets |
 |---|---|
 | text, within both caps | the whole file, inlined between `===== BEGIN ATTACHMENT <name> =====` markers |
-| binary (image, archive, PDF) | name, size and origin only |
-| over `attachment-max-bytes` (64 KiB) | name, size and origin only |
-| past `attachment-total-bytes` (256 KiB in total) | name, size and origin only |
+| binary (image, archive, PDF) | the file itself, in `/tmp/coder-agent-attachments/issue-<N>/` |
+| text over `attachment-max-bytes` (64 KiB) or past `attachment-total-bytes` (256 KiB in total) | the file itself, as above |
+| over `attachment-push-max-bytes` (10 MiB) | name, size and origin only |
 | unreachable | name, size and origin, plus a note that the download failed |
 
 Text vs. binary is decided by sniffing for a NUL byte, not by extension, so an
-extension-less log or a `.patch` is inlined and a `.png` is not. Every
-attachment is listed with its download URL either way, but that URL needs a
-Gitea login — the agent cannot open it, and the prompt says so. **A screenshot
-is therefore still invisible to the agent**; if an image carries the actual
-requirement, describe it in the issue text too.
+extension-less log or a `.patch` is inlined and a `.png` is not.
+
+The workspace holds no Gitea token, so it can't download attachments itself.
+Instead the runner commits every file that isn't inlined, in one commit
+(`[skip ci]`), to a side branch `<branch>-attachments` (e.g.
+`ai/issue-12-attachments`). An instruction at the top of the prompt is a fixed
+`git fetch` + `git archive | tar -x` that unpacks them **outside** the clone
+(`attachment-workspace-dir`), so `finish-issue.sh`'s `git add -A` never picks
+them up and they don't show up in the PR. The side branch is deleted once the
+chat goes idle, or from the exit trap if the run fails. Numbered file names
+(`03-image.png`) keep Gitea's many pasted `image.png` files apart. Whether the
+model can actually *see* an image depends on the file-reading tool of your
+Coder agent. The files also stay in the repository's object store until
+Gitea's next `git gc`. If pushing fails (a branch protection rule matching
+`*-attachments`, or Gitea older than 1.20, which lacks the multi-file contents
+API), the agent gets names and sizes only, as before, and the run carries on.
+Set `attachment-push-max-bytes: "0"` to turn the hand-over off.
 
 Raise the caps when your issues carry big specs or logs:
 
@@ -330,10 +343,12 @@ instead — the action will then never write to the repository on its own.
 | `include-attachments` | `true` | Read the files uploaded to the issue and its comments into the prompt. See *What the agent gets to read* |
 | `attachment-max-bytes` | `65536` | per-file cap for an inlined attachment; bigger files are listed, not inlined |
 | `attachment-total-bytes` | `262144` | total cap across all inlined attachments |
+| `attachment-push-max-bytes` | `10485760` | per-file cap for attachments handed over via the `<branch>-attachments` side branch; `0` = off |
+| `attachment-workspace-dir` | `/tmp/coder-agent-attachments/issue-<N>` | where the agent unpacks them — keep it outside the clone |
 | `require-label` | *(empty)* | Exits early unless the issue carries this label — a second guard behind the workflow's `if:`. Empty by default so a second label wired to its own job doesn't skip itself |
 | `remove-label` | `false` | Drop the trigger label after a run that opened a PR. Off by default; see *Trigger labels* below |
 | `stop-after` | `1h` | `1h` / `30m` / `90s` / `3600` / `now` / `off` |
-| `poll-timeout` / `build-timeout` | `2400` / `900` | seconds |
+| `poll-timeout` / `build-timeout` | `3600` / `900` | seconds. On `poll-timeout` — or when the job is cancelled — the agent chat is interrupted (the UI's stop button) and the workspace is stopped, regardless of `stop-after` |
 | `fail-on-no-pr` | `true` | red job when no PR came out |
 | `max-nudges` | `3` | When the chat goes idle but the branch has not moved (the model ended its turn mid-task), post a "continue and run finish-issue.sh" message and keep polling — up to this many times. `0` = off |
 
