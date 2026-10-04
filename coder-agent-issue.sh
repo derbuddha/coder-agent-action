@@ -143,6 +143,8 @@ BUILD_TIMEOUT="${BUILD_TIMEOUT:-900}"
 # carry on — at most MAX_NUDGES times, then give up as before. 0 = off.
 MAX_NUDGES="${MAX_NUDGES:-3}"
 STOP_AFTER="${STOP_AFTER:-1h}"
+# Attempts per GET when the host is unreachable (HTTP 000). 1 = no retry.
+API_RETRIES="${API_RETRIES:-3}"
 FAIL_ON_NO_PR="${FAIL_ON_NO_PR:-true}"
 RUN_ID="${RUN_ID:-${GITHUB_RUN_ID:-$(date +%s)}}"
 
@@ -162,7 +164,17 @@ api_call() { # label url auth-header method path [body]
     resp=$(curl -sS -w $'\n%{http_code}' -X "$m" "$base$p" \
       -H "$auth" -H "Content-Type: application/json" "${data[@]}" 2>&1) || resp=$'\n000'
   else
-    resp=$(curl -sS -w $'\n%{http_code}' -X "$m" "$base$p" -H "$auth" 2>&1) || resp=$'\n000'
+    # GETs are safe to repeat, so a connection failure (HTTP 000: DNS, refused,
+    # TLS, timeout) gets API_RETRIES attempts with a short backoff — runners
+    # sometimes come up before their network does.
+    local try=1 tries=1
+    [ "$m" = GET ] && tries="$API_RETRIES"
+    while :; do
+      resp=$(curl -sS -w $'\n%{http_code}' -X "$m" "$base$p" -H "$auth" 2>&1) || resp=$'\n000'
+      [ "${resp##*$'\n'}" = 000 ] && [ "$try" -lt "$tries" ] || break
+      echo "    $label API: $m $p unreachable (attempt $try/$tries), retrying in $((try * 5))s..." >&2
+      sleep $((try * 5)); try=$((try + 1))
+    done
   fi
   code="${resp##*$'\n'}"; body="${resp%$'\n'*}"
   case "$code" in
