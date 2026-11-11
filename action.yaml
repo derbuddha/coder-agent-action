@@ -1,6 +1,6 @@
 name: "Coder Agent on Issue"
 description: >-
-  Run a Coder Agent (experimental Chats API) against a Gitea issue in a
+  Run a Coder Agent (Chats API) against a Gitea issue in a
   workspace built from one of your templates, then open a pull request.
 author: "GITEA"
 
@@ -29,7 +29,7 @@ inputs:
     required: false
     default: ""
   coder-model:
-    description: "Model name to pin, resolved via /model-configs (e.g. MiniMax-M3). Empty = deployment default."
+    description: "Model name to pin, resolved against the organization's chat models (e.g. MiniMax-M3). Empty = deployment default."
     required: false
     default: ""
   coder-model-config-id:
@@ -99,6 +99,15 @@ inputs:
   # --- behaviour -------------------------------------------------------------
   extra-prompt:
     description: "Extra instructions appended to the generated prompt (project conventions, test command, ...)."
+    required: false
+    default: ""
+  skill-file:
+    description: >-
+      Repo path of a Markdown skill file with the agent's working rules, read
+      from base-branch (then the work branch) over the Gitea API. Empty = the
+      default skill shipped with this action (skills/default.md). A leading
+      YAML frontmatter block is stripped. The pipeline steps (checkout,
+      attachments, summary, finish script) are not part of the skill.
     required: false
     default: ""
   finish-script-path:
@@ -306,6 +315,7 @@ runs:
         BASE_BRANCH:          ${{ inputs.base-branch }}
         BRANCH_PREFIX:        ${{ inputs.branch-prefix }}
         EXTRA_PROMPT:         ${{ inputs.extra-prompt }}
+        SKILL_FILE:           ${{ inputs.skill-file }}
         FINISH_SCRIPT_PATH:   ${{ inputs.finish-script-path }}
         SUMMARY_PATH:         ${{ inputs.summary-path }}
         BOOTSTRAP_FINISH:     ${{ inputs.bootstrap-finish-script }}

@@ -106,6 +106,8 @@ jobs:
           # Optional: pin a model by name (empty = deployment default).
           coder-model:          ${{ vars.AGENT_MODEL }}
           gitea-token:          ${{ secrets.GITEA_TOKEN }}   # automatic per-job token
+          # Optional repo path of a custom skill file; empty = skills/default.md.
+          skill-file:           ${{ vars.AGENT_SKILL_FILE }}
           stop-after:           "1h"                         # keep the workspace for debugging
           # The PR body always carries `Closes #<issue>`, so merging the PR
           # closes the issue — Gitea does that itself, no extra permission.

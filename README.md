@@ -1,6 +1,6 @@
 # coder-agent-action
 
-A Gitea composite action that runs a **Coder Agent** (experimental Chats API)
+A Gitea composite action that runs a **Coder Agent** (Chats API)
 against an issue and opens a pull request. It replaces `coder-create-task-action`,
 which used the older Tasks API and a template *preset* instead of a model.
 
@@ -17,6 +17,7 @@ below.
 action.yaml               # inputs/outputs, thin composite wrapper
 coder-agent-issue.sh      # all the logic, env-driven, runnable by hand
 finish-issue.sh           # the in-repo git wrapper, bootstrapped on demand
+skills/default.md         # default working rules for the agent (skill file)
 coder-agent.yaml          # the consumer workflow, one job per label
 ```
 
@@ -35,11 +36,31 @@ will **run** the workflow — not on the action's own repo.
 | `CODER_URL` | var | Base URL of the Coder deployment, e.g. `https://coder.example.com` |
 | `CODER_ORG` | var, optional | Coder organization name or UUID. Unset = `coder`, the Coder default |
 | `AGENT_TEMPLATE` | var | Coder template name to build the workspace from, e.g. `dockerUbuntuPython-agent`. Set it at the **org** level and override per repo where a project needs a different image |
-| `AGENT_MODEL` | var, optional | Model name to pin (resolved via `/model-configs`); empty = deployment default |
+| `AGENT_MODEL` | var, optional | Model name to pin (resolved against the organization's chat models); empty = deployment default |
+| `AGENT_SKILL_FILE` | var, optional | Repo path of a custom skill file with the agent's working rules, e.g. `.gitea/skills/coder-agent.md`. Empty = `skills/default.md` of this action |
 
 For a second label wired to a second template, copy the job in the workflow
 below and give it its own variable, e.g. `AGENT_TEMPLATE_CLAUDE` — same idea,
 one variable per job.
+
+### Skill file
+
+The agent's working rules (keep the diff focused, never overwrite a file
+wholesale, run the build/tests) are not hardcoded: they come from a Markdown
+**skill file**. Without configuration the action uses its own
+`skills/default.md`. A repository can bring its own via the `skill-file` input
+— or the `AGENT_SKILL_FILE` variable in the shipped workflows.
+
+- The file is read over the Gitea API from `base-branch`, then from the work
+  branch — the runner has no checkout of the consumer repo.
+- A leading YAML frontmatter block (`--- … ---`) is stripped.
+- A configured but missing file logs a warning and falls back to the default;
+  an empty skill fails the run.
+- Only the working rules are replaceable. The pipeline steps — switching to
+  the work branch, fetching attachments, writing the summary and running
+  `finish-issue.sh` — always stay in the prompt, because the branch check, the
+  nudges and the PR step depend on them.
+- `extra-prompt` still works and is appended after both.
 
 ### 2. The workflow file
 
@@ -284,8 +305,20 @@ its own label again. Review that description, fix what it got wrong, then label
 The two are independent; either works on its own. They only share the issue
 body as a hand-over, so keep `section-begin` / `section-end` at their defaults
 (`<!-- agent:begin -->` / `<!-- agent:end -->`) on both sides — this action
-strips exactly those lines out of the prompt, and overrides them via the same
+finds the section by exactly those lines, and overrides them via the same
 `SECTION_BEGIN` / `SECTION_END` env vars if you do change them.
+
+When the section is present, the prompt no longer mixes it into the issue
+text. The agent gets the human-written rest of the body as the *original
+request* and the section, fenced, as the *specification*, plus rules for
+working from it: follow its proposed change and scope constraints, check its
+claims about the repository against the checkout, treat the acceptance
+criteria as a checklist before finishing, proceed on its stated assumptions,
+and leave follow-ups it names as follow-ups. A comment that explicitly
+corrects the specification wins over it, and the specification wins over the
+original text. Reporting it asks for ends up in the five-sentence PR summary,
+which names any acceptance criterion left unmet. The "Review before
+implementing" footer is dropped, since it is addressed to the reviewer.
 
 ## Bootstrap of `finish-issue.sh`
 
@@ -324,7 +357,7 @@ instead — the action will then never write to the repository on its own.
 | `coder-token` | — | required, service-account session token |
 | `coder-organization` | `coder` | name or UUID |
 | `coder-template-name` | — | template name, normally `${{ vars.AGENT_TEMPLATE }}`; or a UUID via `coder-template-id` |
-| `coder-model` | *(empty)* | model name, resolved via `/model-configs`; empty = deployment default. `coder-model-config-id` takes a UUID directly |
+| `coder-model` | *(empty)* | model name, resolved against the organization's chat models; empty = deployment default. `coder-model-config-id` takes a UUID directly |
 | `gitea-token` | — | required; `secrets.GITEA_TOKEN` works |
 | `gitea-url` | current server | |
 | `gitea-ssh-host` / `gitea-ssh-port` | the repo's own `ssh_url` | only set when the host Gitea advertises isn't reachable from the workspace |
@@ -332,6 +365,7 @@ instead — the action will then never write to the repository on its own.
 | `base-branch` | `main` | |
 | `branch-prefix` | `ai/issue-` | branch is `<prefix><issue-number>` |
 | `extra-prompt` | *(empty)* | appended as "Project-specific notes" |
+| `skill-file` | *(empty)* | repo path of a custom skill file with the agent's working rules; empty = `skills/default.md`. See *Skill file* |
 | `workspace-checkout-dir` | `/home/coder/GIT` | must match the template |
 | `git-repo-parameter` | `git_repo_url` | rich parameter name |
 | `finish-script-path` | `.gitea/scripts/finish-issue.sh` | |
@@ -393,7 +427,7 @@ Both API helpers report the HTTP status and the server's own message, so the
 cause is named rather than inferred:
 
 ```
-Coder API: GET /api/experimental/chats/models -> HTTP 401
+Coder API: GET /api/v2/users/me -> HTTP 401
     You are signed out or your session has expired. Please sign in again to continue.
     (the Coder token is missing, expired or from another deployment)
 ```
@@ -427,8 +461,11 @@ misconfiguration — is still reported, with the script line that failed.
 - `run-name` showing the commit message instead of the issue is
   [go-gitea/gitea#34247](https://github.com/go-gitea/gitea/issues/34247), not a
   config problem.
-- The Chats API is under `/api/experimental/` and can change between Coder
-  releases; the sanity check at the top fails fast if `/chats/models` moves.
+- The Chats API lives under `/api/v2` since Coder 2.37, where models are
+  organization-scoped (`/api/v2/organizations/<org>/chats/models`). Older
+  releases only have `/api/experimental/chats/*`; the sanity check probes the
+  v2 path first, falls back to the experimental one, and uses whichever
+  answers for every chat call.
 - `ssh_url` comes from `SSH_DOMAIN` / `SSH_PORT` in Gitea's `app.ini`. If those
   are wrong, or the name only resolves on the runner's network and not in the
   Coder workspace, set `gitea-ssh-host` / `gitea-ssh-port` — that is the only

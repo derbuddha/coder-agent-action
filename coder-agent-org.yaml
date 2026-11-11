@@ -76,6 +76,8 @@ jobs:
           # Optional: pin a model by name (empty = deployment default).
           AGENT_MODEL:         ${{ vars.AGENT_MODEL }}
           FORGE_TOKEN:         ${{ secrets.GITEA_TOKEN }}   # automatic per-job token
+          # Optional repo path of a custom skill file; empty = .action/skills/default.md.
+          SKILL_FILE:          ${{ vars.AGENT_SKILL_FILE }}
           STOP_AFTER:          "1h"    # keep the workspace for debugging
           # The agent writes its 5-sentence change summary to
           # .gitea/agent-summary.md (the action's built-in default). The action
@@ -117,6 +119,7 @@ jobs:
       #     coder-template-name: ${{ vars.AGENT_TEMPLATE }}
       #     coder-model:         ${{ vars.AGENT_MODEL }}
       #     gitea-token:         ${{ secrets.GITEA_TOKEN }}
+      #     skill-file:          ${{ vars.AGENT_SKILL_FILE }}
       #     stop-after:          "1h"
       #     summary-path:        ".gitea/agent-summary.md"
       #     # gitea-ssh-host:    git-ssh.example.com

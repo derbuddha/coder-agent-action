@@ -129,7 +129,7 @@ REMOVE_LABEL="${REMOVE_LABEL:-false}"
 WS_CHECKOUT_DIR="${WS_CHECKOUT_DIR:-/home/coder/GIT}"
 # Marker lines that gitea/refine-issue-action writes around its generated
 # section. Kept in sync with that action's section-begin / section-end inputs;
-# only used to strip the scaffolding out of the prompt.
+# used to split that section out of the body as the agent's specification.
 SECTION_BEGIN="${SECTION_BEGIN:-<!-- agent:begin -->}"
 SECTION_END="${SECTION_END:-<!-- agent:end -->}"
 GIT_REPO_PARAM="${GIT_REPO_PARAM:-git_repo_url}"
@@ -279,12 +279,12 @@ die() { # reason [hint]
 
 # The same as pressing the stop button in the Coder UI, plus stopping the
 # workspace so nothing the agent already queued can still commit or push.
-# Chats moved from /api/experimental to /api/v2 in later Coder releases, so
-# try both. Best effort throughout: this also runs from the exit trap.
+# Best effort throughout: this also runs from the exit trap. CHAT_ID is only
+# ever set after the sanity step has picked CHAT_API.
 halt_agent() { # why
   echo "==> Stopping the agent ($1)"
   if [ -n "${CHAT_ID:-}" ]; then
-    if coder_api POST "/api/experimental/chats/$CHAT_ID/interrupt" >/dev/null 2>&1       || coder_api POST "/api/v2/chats/$CHAT_ID/interrupt" >/dev/null 2>&1; then
+    if coder_api POST "$CHAT_API/chats/$CHAT_ID/interrupt" >/dev/null 2>&1; then
       echo "    chat interrupted"
     else
       echo "!! Could not interrupt the chat — stop it by hand: $CHAT_URL"
@@ -437,15 +437,6 @@ coder_api GET /api/v2/users/me >/dev/null \
   || die "Could not authenticate to $CODER_URL." \
          "HTTP 401 means the token is stale — mint a new one (\`coder tokens create --name gitea-actions --lifetime 1y\`) and update the \`coder-token\` secret. HTTP 000 means the runner cannot reach \`coder-url\` at all."
 
-echo "==> Sanity: at least one LLM model configured?"
-# The endpoint returns an object ({providers, unsupported_providers}); count the
-# actual models recursively rather than the number of top-level keys.
-MODEL_COUNT=$(coder_api GET /api/experimental/chats/models \
-  | jq '[.providers[]? | (.. | objects | select(has("id")))] | length') || exit 1
-[ "${MODEL_COUNT:-0}" -gt 0 ] \
-  || die "No LLM model is configured on $CODER_URL." \
-         "Add a provider and model to the Coder deployment, then re-run."
-
 if [[ "$CODER_ORG" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}- ]]; then
   CODER_ORG_ID="$CODER_ORG"
 else
@@ -456,6 +447,27 @@ else
     "Set the \`CODER_ORG\` variable to an organization name or UUID that exists on $CODER_URL."
 fi
 echo "    organization_id=$CODER_ORG_ID"
+
+echo "==> Sanity: at least one LLM model configured?"
+# Coder 2.37 promoted chats to /api/v2 and made models organization-scoped
+# ({models, providers, ...}); older releases only have the deployment-wide
+# /api/experimental list ({providers, unsupported_providers}), where the models
+# are counted recursively. Whichever answers picks the prefix for every chat call.
+if CHAT_MODELS=$(coder_api GET "/api/v2/organizations/$CODER_ORG_ID/chats/models"); then
+  CHAT_API=/api/v2
+  MODEL_COUNT=$(echo "$CHAT_MODELS" | jq '[.models[]? | select(.enabled)] | length')
+elif CHAT_MODELS=$(coder_api GET /api/experimental/chats/models); then
+  CHAT_API=/api/experimental
+  MODEL_COUNT=$(echo "$CHAT_MODELS" \
+    | jq '[.providers[]? | (.. | objects | select(has("id")))] | length')
+else
+  die "No Chats API found on $CODER_URL." \
+      "Neither /api/v2/organizations/<org>/chats/models nor /api/experimental/chats/models answered — the Coder release may predate Coder Agents, or the feature is disabled."
+fi
+echo "    chat_api=$CHAT_API"
+[ "${MODEL_COUNT:-0}" -gt 0 ] \
+  || die "No enabled LLM model is configured on $CODER_URL." \
+         "Add a provider and model to the Coder deployment (organization '$CODER_ORG'), then re-run."
 
 if [ -z "${AGENT_TEMPLATE_ID:-}" ]; then
   echo "==> Resolving template '$AGENT_TEMPLATE' -> UUID"
@@ -469,10 +481,16 @@ fi
 echo "    template_id=$AGENT_TEMPLATE_ID"
 
 # Optional model pinning. MODEL_CONFIG_ID (UUID) wins; else AGENT_MODEL is looked
-# up in /model-configs by .model or .display_name, preferring enabled entries.
+# up among the chat models by .model or .display_name, preferring enabled entries.
+# On /api/v2 the org model list already carries the configs; older releases
+# keep them under /model-configs.
 if [ -z "${MODEL_CONFIG_ID:-}" ] && [ -n "${AGENT_MODEL:-}" ]; then
   echo "==> Resolving model '$AGENT_MODEL' -> model_config_id"
-  MC=$(coder_api GET "/api/experimental/chats/model-configs") || MC='{}'
+  if [ "$CHAT_API" = /api/v2 ]; then
+    MC="$CHAT_MODELS"
+  else
+    MC=$(coder_api GET "/api/experimental/chats/model-configs") || MC='{}'
+  fi
   read -r MODEL_CONFIG_ID MODEL_CTX <<<"$(echo "$MC" | jq -r --arg m "$AGENT_MODEL" '
     [ .. | objects
       | select(((.id? // "") | tostring | test("^[0-9a-f]{8}-")))
@@ -480,7 +498,7 @@ if [ -z "${MODEL_CONFIG_ID:-}" ] && [ -n "${AGENT_MODEL:-}" ]; then
     | (map(select(.enabled == true)) + map(select(.enabled != true)))
     | (.[0] // {}) | "\(.id // "") \(.context_limit // "")"')"
   [ -n "$MODEL_CONFIG_ID" ] \
-    || die "Could not resolve model '$AGENT_MODEL' in /model-configs." \
+    || die "Could not resolve model '$AGENT_MODEL' among the chat models on $CODER_URL." \
            "Use a model or display name the deployment lists, or clear the \`AGENT_MODEL\` variable to take the default."
   echo "    model_config_id=$MODEL_CONFIG_ID (context_limit=${MODEL_CTX:-?})"
 fi
@@ -552,13 +570,30 @@ ITITLE=$(echo "$ISSUE" | jq -r '.title')
 IBODY=$(echo "$ISSUE"  | jq -r '.body // ""')
 
 # gitea/refine-issue-action wraps its generated description in marker lines and
-# signs it off with a "Review before implementing" footer. The description
-# itself is exactly what the agent should read, so keep it — but drop the
-# scaffolding, which is addressed to a human reviewer, not to the agent.
-IBODY=$(printf '%s\n' "$IBODY" \
-  | grep -vxF -e "$SECTION_BEGIN" -e "$SECTION_END" \
-  | grep -v '^_Generated from the repository context by .*Review before implementing\._$' \
+# signs it off with a "Review before implementing" footer. That description is
+# a reviewed implementation plan — proposed change, scope, acceptance criteria
+# — so it is split out of the body and handed to the agent as its primary
+# brief, with the human-written rest of the body kept as the original request.
+# The footer is addressed to a human reviewer, not to the agent, and is dropped.
+# Markers are matched as whole lines, ignoring trailing whitespace and the CR
+# of CRLF bodies; an unclosed begin marker runs to the end of the body.
+split_section() { # in|out — print the lines inside or outside the marker pairs
+  awk -v want="$1" -v b="$SECTION_BEGIN" -v e="$SECTION_END" '
+    { l = $0; sub(/[ \t\r]+$/, "", l) }
+    l == b { inside = 1; next }
+    l == e { inside = 0; next }
+    (want == "in") == (inside == 1)'
+}
+ISPEC=$(printf '%s\n' "$IBODY" | split_section in \
+  | grep -v '^_Generated from the repository context by .*Review before implementing\._[[:space:]]*$' \
   || true)
+if [ -n "${ISPEC//[[:space:]]/}" ]; then
+  IBODY=$(printf '%s\n' "$IBODY" | split_section out)
+  [ -n "${IBODY//[[:space:]]/}" ] || IBODY=""
+  echo "    refined specification found ($(printf '%s\n' "$ISPEC" | wc -l) lines)"
+else
+  ISPEC=""
+fi
 
 # --- comments ----------------------------------------------------------------
 # Walk every page: Gitea's default paging is 30, so a single unpaged call fed
@@ -745,13 +780,99 @@ if [ "${ATT_PUSHED:-0}" -gt 0 ]; then
 "
 fi
 
+# --- skill -------------------------------------------------------------------
+# The agent's working rules come from a skill file: a custom one from the
+# consumer repo (read over the API — the runner has no checkout of it), else
+# skills/default.md shipped with this action. Only the rules are replaceable;
+# the pipeline steps in the prompt below stay fixed, because the branch check,
+# the nudges and the PR step depend on them.
+SKILL_FILE="${SKILL_FILE:-}"
+SKILL_RAW=""
+if [ -n "$SKILL_FILE" ]; then
+  for ref in "$BASE_BRANCH" "$BRANCH"; do
+    if SKILL_JSON=$(gitea_api GET "/repos/$REPO_OWNER/$REPO_NAME/contents/${SKILL_FILE#./}?ref=$ref" 2>/dev/null) \
+       && [ -n "$SKILL_JSON" ]; then
+      SKILL_RAW=$(printf '%s' "$SKILL_JSON" | jq -r '.content // ""' | tr -d '\n' | base64 -d 2>/dev/null || true)
+      if [ -n "$SKILL_RAW" ]; then echo "==> Skill: ${SKILL_FILE} (on ${ref})"; break; fi
+    fi
+  done
+  [ -n "$SKILL_RAW" ] || echo "!! skill-file '${SKILL_FILE}' not found on ${BASE_BRANCH} or ${BRANCH} — using the default skill."
+  : > "$API_ERR_FILE"  # a missing custom skill is not the run's failure reason
+fi
+if [ -z "$SKILL_RAW" ]; then
+  DEFAULT_SKILL="$ACTION_PATH/skills/default.md"
+  [ -f "$DEFAULT_SKILL" ] || DEFAULT_SKILL="$(dirname "${BASH_SOURCE[0]}")/skills/default.md"
+  [ -f "$DEFAULT_SKILL" ] || die "Default skill skills/default.md not found under $ACTION_PATH." \
+    "The action repo was checked out incompletely — check the actions/checkout step."
+  SKILL_RAW=$(cat "$DEFAULT_SKILL")
+  echo "==> Skill: default ($DEFAULT_SKILL)"
+fi
+
+# --- issue text --------------------------------------------------------------
+# With a refined specification the prompt shows the original request and the
+# specification as two clearly fenced parts, and adds rules on how to work
+# from the specification. Without one the body goes in as before.
+SPEC_RULES=""
+if [ -n "$ISPEC" ]; then
+  ISSUE_TEXT="The issue carries a refined SPECIFICATION, generated from the repository by
+refine-issue-agent and reviewed by a maintainer before this run. It is your
+primary brief; the original issue text is the request it was derived from.
+
+Original issue text:
+
+${IBODY:-(none — the issue body consists only of the specification)}
+
+=== SPECIFICATION BEGIN ===
+${ISPEC}
+=== SPECIFICATION END ==="
+  SPEC_RULES="- Work from the SPECIFICATION. Its sections are \"Summary\", \"Context\",
+  \"Proposed change\", \"Affected files\", \"Acceptance criteria\" and
+  \"Assumptions and open questions\" (the headings may be translated into the
+  issue's language). Read the whole specification before you start.
+- \"Proposed change\" is your plan: carry it out step by step and honour every
+  constraint it states (e.g. \"documentation-only\", \"do not modify …\",
+  \"smallest necessary edits\").
+- \"Affected files\" is the expected scope, not a hard limit: touch other files
+  only when the change genuinely needs them, and say so in your summary.
+- The specification was written from the file tree, READMEs, docs and
+  manifests only — not from the source code — and possibly from a partial
+  tree. Check every factual claim it makes (paths, counts, file names,
+  commands, existing behaviour) against the actual checkout before relying on
+  it. Where it is wrong, follow the repository and mention the discrepancy in
+  your summary. Verify by reading files and git history; do not install
+  dependencies, start servers or contact live/production hosts just to
+  confirm a claim, unless the specification explicitly asks for it.
+- Once you have the facts you need, stop investigating and make the change.
+  Do not re-audit what you have already checked.
+- \"Acceptance criteria\" is your checklist: before finishing, go through every
+  item, verify it against your result and fix whatever is not met.
+- \"Assumptions and open questions\" cannot be answered during this run:
+  proceed on the stated assumptions, and where one proves false choose the
+  most conservative option consistent with the specification. If it asks you
+  to record something as a follow-up instead of fixing it, do not fix it —
+  mention it in your summary.
+- Precedence: a comment that explicitly corrects the specification wins over
+  it; the specification wins over the original issue text where they differ.
+- Anything the specification wants reported in the pull request or a
+  completion note goes into the summary file described below, within its
+  five-sentence limit; name any acceptance criterion left unmet in sentence 5.
+"
+else
+  ISSUE_TEXT="$IBODY"
+fi
+# Strip a leading YAML frontmatter block (--- ... ---).
+SKILL_TEXT=$(printf '%s\n' "$SKILL_RAW" \
+  | awk 'NR == 1 && $0 == "---" { fm = 1; next } fm && $0 == "---" { fm = 0; next } !fm')
+[ -n "${SKILL_TEXT//[[:space:]]/}" ] || die "The skill file is empty." \
+  "Fill ${SKILL_FILE:-skills/default.md} with the agent's working rules, or clear skill-file."
+
 read -r -d '' PROMPT <<TXT || true
 You are working in a checked-out clone of ${REPO_OWNER}/${REPO_NAME} located at
 ${REPO_DIR}. Implement the change requested in the Gitea issue below.
 
 ISSUE #${ISSUE_NUM}: ${ITITLE}
 
-${IBODY}
+${ISSUE_TEXT}
 ${ICOMMENTS:+
 Comments on the issue, oldest first:
 
@@ -766,12 +887,11 @@ something you needed was unreadable:
 
 ${IATTACH}
 }
-Instructions:
-${CHECKOUT_STEP}- Edit the files needed to resolve the issue. Keep the diff focused.
-- NEVER overwrite an existing file wholesale. Read it first, then append or edit
-  the relevant part only. Check whether a file exists before creating it.
-- Run the project's build/tests if present.
-- Before the final commit-and-push below, write EXACTLY five sentences (no more,
+Working rules:
+${SKILL_TEXT}
+
+Instructions (these always apply, whatever the working rules say):
+${CHECKOUT_STEP}${SPEC_RULES}- Before the final commit-and-push below, write EXACTLY five sentences (no more,
   no fewer) describing what you changed and how you verified it to
   ${SUMMARY_PATH} (plain Markdown, no front-matter, no headings). Sentence 1:
   the goal. Sentence 2-3: what you changed. Sentence 4: how you verified it.
@@ -838,7 +958,7 @@ CHAT_BODY=$(jq -n --arg org "$CODER_ORG_ID" --arg ws "$WORKSPACE_ID" \
   { organization_id: $org, workspace_id: $ws,
     content: [ { type: "text", text: $text } ] }
   + (if $mc == "" then {} else { model_config_id: $mc } end)')
-CHAT_ID=$(coder_api POST "/api/experimental/chats" "$CHAT_BODY" | jq -r '.id') \
+CHAT_ID=$(coder_api POST "$CHAT_API/chats" "$CHAT_BODY" | jq -r '.id') \
   || die "Could not create the chat on $CODER_URL." \
          "The workspace is up — check that the Chats API is enabled and the model is still configured."
 CHAT_URL="${CODER_URL}${CODER_CHAT_PATH}${CHAT_ID}"
@@ -868,11 +988,14 @@ and as your FINAL action run EXACTLY: bash ${REPO_DIR}/${FINISH_SCRIPT_PATH} \"$
 Do not stop until that command has run."
 
 echo "==> Polling chat (timeout ${POLL_TIMEOUT}s, max ${MAX_NUDGES} nudge(s)); waiting for running -> waiting"
-deadline=$(( $(date +%s) + POLL_TIMEOUT )); seen_active=0; nudges=0; nudged_at=0; TIMED_OUT=false
+poll_start=$(date +%s)
+deadline=$(( poll_start + POLL_TIMEOUT )); seen_active=0; nudges=0; nudged_at=0; TIMED_OUT=false
 while :; do
-  st=$(coder_api GET "/api/experimental/chats/$CHAT_ID" | jq -r '.status') \
+  st=$(coder_api GET "$CHAT_API/chats/$CHAT_ID" | jq -r '.status') \
     || die "Lost contact with Coder while polling the chat." "$CHAT_URL"
-  echo "    chat status=$st"
+  elapsed=$(( $(date +%s) - poll_start ))
+  printf '    [%s] chat status=%s (elapsed %dm%02ds)\n' \
+    "$(date +%H:%M:%S)" "$st" $(( elapsed / 60 )) $(( elapsed % 60 ))
   case "$st" in
     pending|running|requires_action|interrupting) seen_active=1; nudged_at=0 ;;
     error) echo "Agent reported an error."; FAIL=1; break ;;
@@ -891,7 +1014,7 @@ while :; do
         fi
         nudges=$((nudges + 1))
         echo "    agent went idle without pushing $BRANCH — nudge ${nudges}/${MAX_NUDGES}"
-        coder_api POST "/api/experimental/chats/$CHAT_ID/messages" \
+        coder_api POST "$CHAT_API/chats/$CHAT_ID/messages" \
           "$(jq -n --arg t "$NUDGE_TEXT" '{content: [{type: "text", text: $t}]}')" >/dev/null \
           || { echo "    could not post the nudge; giving up on nudging"; FAIL=0; break; }
         seen_active=0; nudged_at=$(date +%s)
