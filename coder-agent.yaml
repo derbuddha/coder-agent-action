@@ -42,7 +42,7 @@ permissions:
 jobs:
   # One job per label: to wire a second label to another template or model,
   # copy this job, change the label in `if:` and point coder-template-name at
-  # its own variable (e.g. vars.AGENT_TEMPLATE_CLAUDE).
+  # its own variable (e.g. vars.CODER_TEMPLATE_CLAUDE).
   agent:
     runs-on: ubuntu-24.04
     # Gitea maps `labeled` to action `label_updated`; the added label's name is
@@ -56,9 +56,9 @@ jobs:
         # resolves to github.com unless that is set to `self` — an internet call
         # you may not want. (No local mirror? The README does the same fetch as
         # a plain git-clone script.)
-        uses: https://gitea.example.com/actions/checkout@v4
+        uses: builtin:checkout
         with:
-          repository: gitea/coder-agent-action
+          repository: helper-actions/coder-agent-action
           ref: main
           # PAT first; the per-job token only works if the repo becomes public.
           token: ${{ secrets.ACTION_CLONE_TOKEN || secrets.GITEA_TOKEN }}
@@ -70,9 +70,9 @@ jobs:
           # github-server-url: https://gitea.example.com
 
       - name: Fetch the notify action
-        uses: https://gitea.example.com/actions/checkout@v4
+        uses: builtin:checkout
         with:
-          repository: gitea/notify-workflow-action
+          repository: helper-actions/notify-workflow-action
           ref: main
           token: ${{ secrets.ACTION_CLONE_TOKEN || secrets.GITEA_TOKEN }}
           path: .actions/notify-workflow-action
@@ -102,9 +102,9 @@ jobs:
           coder-organization:   ${{ vars.CODER_ORG_ID }}
           # Template name comes from the repo (or org) variable, so switching
           # templates is a settings change, not a commit.
-          coder-template-name:  ${{ vars.AGENT_TEMPLATE }}
+          coder-template-name:  ${{ vars.CODER_TEMPLATE }}
           # Optional: pin a model by name (empty = deployment default).
-          coder-model:          ${{ vars.AGENT_MODEL }}
+          coder-model:          ${{ vars.CODER_MODEL }}
           gitea-token:          ${{ secrets.GITEA_TOKEN }}   # automatic per-job token
           # Optional repo path of a custom skill file; empty = skills/default.md.
           skill-file:           ${{ vars.AGENT_SKILL_FILE }}

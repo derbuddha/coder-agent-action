@@ -28,16 +28,18 @@ set -euo pipefail
 
 # --- required ----------------------------------------------------------------
 : "${CODER_URL:?e.g. https://coder.example.com}"
-: "${CODER_SESSION_TOKEN:?service-account API token}"
+# CODER_SESSION_TOKEN is still accepted for older setups.
+CODER_TOKEN="${CODER_TOKEN:-${CODER_SESSION_TOKEN:-}}"
+: "${CODER_TOKEN:?is empty — set the CODER_TOKEN secret (Coder service-account token) on the repo or org}"
 
 # Gitea Actions forbids secrets named GITEA_*, so the token arrives as
 # FORGE_TOKEN there; a plain shell can just export GITEA_TOKEN.
 GITEA_TOKEN="${GITEA_TOKEN:-${FORGE_TOKEN:-}}"
 : "${GITEA_TOKEN:?set GITEA_TOKEN (shell) or FORGE_TOKEN (CI) — needs repo+issue+PR scope}"
 
-if [ -z "${AGENT_TEMPLATE_ID:-}" ] && [ -z "${AGENT_TEMPLATE:-}" ]; then
+if [ -z "${CODER_TEMPLATE_ID:-}" ] && [ -z "${CODER_TEMPLATE:-}" ]; then
   echo "Set coder-template-name (or coder-template-id). In Actions this comes"
-  echo "from the AGENT_TEMPLATE repo/org variable — check it is set and not empty."
+  echo "from the CODER_TEMPLATE repo/org variable — check it is set and not empty."
   exit 1
 fi
 
@@ -201,7 +203,7 @@ api_call() { # label url auth-header method path [body]
   return 1
 }
 coder_api() { # method path [body]
-  api_call Coder "$CODER_URL" "Coder-Session-Token: $CODER_SESSION_TOKEN" "$@"
+  api_call Coder "$CODER_URL" "Coder-Session-Token: $CODER_TOKEN" "$@"
 }
 gitea_api() { # method path [body]
   api_call Gitea "$GITEA_URL/api/v1" "Authorization: token $GITEA_TOKEN" "$@"
@@ -217,6 +219,22 @@ gitea_download() { # url outfile max-bytes
 }
 # The attachments side branch only has to live until the agent has fetched it;
 # called once the chat goes idle and again from the exit trap. Best effort.
+# Delete one file from $BRANCH over the contents API (a commit on the branch).
+# Best effort: a missing file is fine, a failure only warns.
+drop_branch_file() { # path
+  local sha
+  sha=$(gitea_api GET "/repos/$REPO_OWNER/$REPO_NAME/contents/$1?ref=$BRANCH" 2>/dev/null \
+        | jq -r '.sha // empty' 2>/dev/null) || true
+  if [ -z "$sha" ]; then : > "$API_ERR_FILE"; return 0; fi
+  if gitea_api DELETE "/repos/$REPO_OWNER/$REPO_NAME/contents/$1" \
+       "$(jq -n --arg s "$sha" --arg b "$BRANCH" --arg p "$1" \
+            '{sha:$s, branch:$b, message:"ci: remove agent helper file \($p)"}')" >/dev/null 2>&1; then
+    echo "    removed $1 from $BRANCH"
+  else
+    echo "!! Could not remove $1 from $BRANCH — delete it by hand before merging."
+  fi
+  : > "$API_ERR_FILE"  # not the run's failure reason
+}
 drop_att_branch() {
   [ "$ATT_BRANCH_CREATED" = true ] || return 0
   if gitea_api DELETE "/repos/$REPO_OWNER/$REPO_NAME/branches/$ATT_BRANCH" >/dev/null 2>&1; then
@@ -469,37 +487,37 @@ echo "    chat_api=$CHAT_API"
   || die "No enabled LLM model is configured on $CODER_URL." \
          "Add a provider and model to the Coder deployment (organization '$CODER_ORG'), then re-run."
 
-if [ -z "${AGENT_TEMPLATE_ID:-}" ]; then
-  echo "==> Resolving template '$AGENT_TEMPLATE' -> UUID"
-  AGENT_TEMPLATE_ID=$(coder_api GET \
-    "/api/v2/organizations/$CODER_ORG_ID/templates/$AGENT_TEMPLATE" | jq -r '.id // empty') \
-    || AGENT_TEMPLATE_ID=""
-  [ -n "$AGENT_TEMPLATE_ID" ] \
-    || die "Could not resolve template '$AGENT_TEMPLATE' in organization '$CODER_ORG'." \
-           "Check the \`AGENT_TEMPLATE\` variable against the template names on $CODER_URL/templates."
+if [ -z "${CODER_TEMPLATE_ID:-}" ]; then
+  echo "==> Resolving template '$CODER_TEMPLATE' -> UUID"
+  CODER_TEMPLATE_ID=$(coder_api GET \
+    "/api/v2/organizations/$CODER_ORG_ID/templates/$CODER_TEMPLATE" | jq -r '.id // empty') \
+    || CODER_TEMPLATE_ID=""
+  [ -n "$CODER_TEMPLATE_ID" ] \
+    || die "Could not resolve template '$CODER_TEMPLATE' in organization '$CODER_ORG'." \
+           "Check the \`CODER_TEMPLATE\` variable against the template names on $CODER_URL/templates."
 fi
-echo "    template_id=$AGENT_TEMPLATE_ID"
+echo "    template_id=$CODER_TEMPLATE_ID"
 
-# Optional model pinning. MODEL_CONFIG_ID (UUID) wins; else AGENT_MODEL is looked
+# Optional model pinning. MODEL_CONFIG_ID (UUID) wins; else CODER_MODEL is looked
 # up among the chat models by .model or .display_name, preferring enabled entries.
 # On /api/v2 the org model list already carries the configs; older releases
 # keep them under /model-configs.
-if [ -z "${MODEL_CONFIG_ID:-}" ] && [ -n "${AGENT_MODEL:-}" ]; then
-  echo "==> Resolving model '$AGENT_MODEL' -> model_config_id"
+if [ -z "${MODEL_CONFIG_ID:-}" ] && [ -n "${CODER_MODEL:-}" ]; then
+  echo "==> Resolving model '$CODER_MODEL' -> model_config_id"
   if [ "$CHAT_API" = /api/v2 ]; then
     MC="$CHAT_MODELS"
   else
     MC=$(coder_api GET "/api/experimental/chats/model-configs") || MC='{}'
   fi
-  read -r MODEL_CONFIG_ID MODEL_CTX <<<"$(echo "$MC" | jq -r --arg m "$AGENT_MODEL" '
+  read -r MODEL_CONFIG_ID MODEL_CTX <<<"$(echo "$MC" | jq -r --arg m "$CODER_MODEL" '
     [ .. | objects
       | select(((.id? // "") | tostring | test("^[0-9a-f]{8}-")))
       | select((.model? == $m) or (.display_name? == $m)) ]
     | (map(select(.enabled == true)) + map(select(.enabled != true)))
     | (.[0] // {}) | "\(.id // "") \(.context_limit // "")"')"
   [ -n "$MODEL_CONFIG_ID" ] \
-    || die "Could not resolve model '$AGENT_MODEL' among the chat models on $CODER_URL." \
-           "Use a model or display name the deployment lists, or clear the \`AGENT_MODEL\` variable to take the default."
+    || die "Could not resolve model '$CODER_MODEL' among the chat models on $CODER_URL." \
+           "Use a model or display name the deployment lists, or clear the \`CODER_MODEL\` variable to take the default."
   echo "    model_config_id=$MODEL_CONFIG_ID (context_limit=${MODEL_CTX:-?})"
 fi
 
@@ -891,7 +909,12 @@ Working rules:
 ${SKILL_TEXT}
 
 Instructions (these always apply, whatever the working rules say):
-${CHECKOUT_STEP}${SPEC_RULES}- Before the final commit-and-push below, write EXACTLY five sentences (no more,
+${CHECKOUT_STEP}${SPEC_RULES}- The workspace may already run the application (e.g. a preview or dev
+  server) from this checkout, and it may write runtime files or rewrite
+  config files while you work. That is expected: do not investigate, stop,
+  restart or work around it, and do not run the application or its CLI
+  yourself. Only edit the files your change needs.
+- Before the final commit-and-push below, write EXACTLY five sentences (no more,
   no fewer) describing what you changed and how you verified it to
   ${SUMMARY_PATH} (plain Markdown, no front-matter, no headings). Sentence 1:
   the goal. Sentence 2-3: what you changed. Sentence 4: how you verified it.
@@ -915,12 +938,12 @@ WS_NAME="${WS_NAME%%-}"
 
 echo "==> Creating workspace '$WS_NAME' (clone $GIT_REPO_SSH)"
 echo "    rich parameter sent to Coder: $GIT_REPO_PARAM=$GIT_REPO_SSH"
-WS_BODY=$(jq -n --arg t "$AGENT_TEMPLATE_ID" --arg n "$WS_NAME" \
+WS_BODY=$(jq -n --arg t "$CODER_TEMPLATE_ID" --arg n "$WS_NAME" \
                --arg p "$GIT_REPO_PARAM" --arg u "$GIT_REPO_SSH" '
   { template_id: $t, name: $n,
     rich_parameter_values: [ { name: $p, value: $u } ] }')
 WS_RESP=$(coder_api POST "/api/v2/users/me/workspaces" "$WS_BODY") \
-  || die "Could not create workspace '$WS_NAME' from template '$AGENT_TEMPLATE'." \
+  || die "Could not create workspace '$WS_NAME' from template '$CODER_TEMPLATE'." \
          "A rich parameter the template requires may be missing, or \`$GIT_REPO_PARAM\` is not the name it uses for the clone URL."
 WORKSPACE_ID=$(echo "$WS_RESP" | jq -r '.id')
 WS_NAME=$(echo "$WS_RESP" | jq -r '.name')
@@ -950,6 +973,107 @@ while :; do
            "Raise \`build-timeout\`, or check the provisioner on $CODER_URL."
   sleep 8 & wait $!
 done
+
+# --- 4b. startup / clone gate ------------------------------------------------
+# 'running' only means the build finished — the agent's startup script (which
+# clones the repo) runs after that. If the clone fails (e.g. Coder's git SSH
+# key isn't registered on Gitea → "Permission denied (publickey)") the agent
+# would get an empty checkout and burn its whole budget poking at Coder's auth
+# instead of the issue. So wait for the agent to finish starting, read its
+# startup log, and stop here with the reason on the issue.
+echo "==> Waiting for the workspace agent to finish its startup script"
+ws_agents() {
+  coder_api GET "/api/v2/workspaces/$WORKSPACE_ID" \
+    | jq -c '[.latest_build.resources[]?.agents[]? | {id, name, lifecycle_state}]'
+}
+while :; do
+  AGENTS_JSON=$(ws_agents) \
+    || die "Lost contact with Coder while waiting for the workspace agent." "$WORKSPACE_URL"
+  states=$(printf '%s' "$AGENTS_JSON" | jq -r '[.[].lifecycle_state] | join(",")')
+  echo "    agent lifecycle=${states:-none}"
+  # Done once no agent is still created/starting.
+  printf '%s' "$AGENTS_JSON" \
+    | jq -e 'all(.[]; .lifecycle_state != "created" and .lifecycle_state != "starting")' >/dev/null \
+    && break
+  [ "$(date +%s)" -ge "$deadline" ] \
+    && die "The workspace agent did not finish starting within ${BUILD_TIMEOUT}s." \
+           "The startup script (repo clone) may be hanging — open the workspace and read the agent log."
+  sleep 5 & wait $!
+done
+
+STARTUP_LOG=""
+for aid in $(printf '%s' "$AGENTS_JSON" | jq -r '.[].id'); do
+  STARTUP_LOG+=$(coder_api GET "/api/v2/workspaceagents/$aid/logs" 2>/dev/null \
+                   | jq -r '.[]?.output // empty' 2>/dev/null || true)$'\n'
+done
+# Lines that mean the checkout is missing or unusable.
+CLONE_ERRORS=$(printf '%s' "$STARTUP_LOG" | grep -E \
+  'Permission denied \(publickey|Could not read from remote repository|Host key verification failed|fatal: (repository .* not found|unable to access|could not create work tree|destination path .* already exists and is not an empty)|fatal: Authentication failed' \
+  | sed -E 's/\x1b\[[0-9;]*m//g' | head -n 15 || true)
+FAILED_AGENTS=$(printf '%s' "$AGENTS_JSON" \
+  | jq -r '[.[] | select(.lifecycle_state == "start_error") | .name] | join(", ")')
+
+if [ -n "$CLONE_ERRORS" ] || [ -n "$FAILED_AGENTS" ]; then
+  if [ -n "$CLONE_ERRORS" ]; then
+    reason="The workspace could not clone \`$GIT_REPO_SSH\` — the agent was not started."
+  else
+    reason="The workspace startup script failed (agent: $FAILED_AGENTS) — the agent was not started."
+  fi
+  detail="${CLONE_ERRORS:-$(printf '%s' "$STARTUP_LOG" | sed -E 's/\x1b\[[0-9;]*m//g' | grep -v '^[[:space:]]*$' | tail -n 15)}"
+  echo "$detail" >&2
+  halt_agent "workspace startup failed" || true
+  die "$reason" \
+      "This is a Coder/workspace problem, not an issue problem: check that the Coder git SSH key (\`coder publickey\`) is added to a Gitea account with access to ${REPO_OWNER}/${REPO_NAME}, then re-run.
+
+Startup log:
+\`\`\`
+${detail}
+\`\`\`"
+fi
+
+# No error lines is not proof of a checkout: a template that skips the clone, or
+# clones somewhere else, logs nothing wrong and still leaves $REPO_DIR empty.
+# So look for $REPO_DIR/.git through the agent's file-listing API (the one the
+# Coder UI's folder picker uses — no CLI or SSH needed on the runner).
+ws_ls() { # agent-id absolute-path -> LSResponse JSON
+  coder_api POST "/api/v2/workspaceagents/$1/ls" \
+    "$(jq -n --arg p "$2" \
+        '{path: ($p | split("/") | map(select(. != ""))), relativity: "root"}')" \
+    2>/dev/null
+}
+LS_AGENT=""
+for aid in $(printf '%s' "$AGENTS_JSON" | jq -r '.[].id'); do
+  if ws_ls "$aid" / >/dev/null; then LS_AGENT="$aid"; break; fi
+done
+if [ -z "$LS_AGENT" ]; then
+  # Older Coder without /ls, or the agent isn't reachable: don't block the run
+  # on a check we can't make, but leave a trace in the log.
+  echo "    warning: cannot list files in the workspace — skipping the checkout check" >&2
+else
+  # Short grace period for templates whose clone finishes just after 'ready'.
+  checkout_ok=false
+  for _ in 1 2 3 4 5 6; do
+    if ws_ls "$LS_AGENT" "$REPO_DIR" \
+         | jq -e '.contents[]? | select(.name == ".git")' >/dev/null 2>&1; then
+      checkout_ok=true; break
+    fi
+    sleep 5 & wait $!
+  done
+  if [ "$checkout_ok" != "true" ]; then
+    detail=$(printf '%s' "$STARTUP_LOG" | sed -E 's/\x1b\[[0-9;]*m//g' \
+               | grep -v '^[[:space:]]*$' | tail -n 15)
+    echo "${detail:-<empty startup log>}" >&2
+    halt_agent "repository checkout missing" || true
+    die "The workspace has no git checkout at \`$REPO_DIR\` — the agent was not started." \
+        "The startup log shows no clone error, so the clone most likely never ran or went to another directory. Check that the template clones \`$GIT_REPO_SSH\` into \`$REPO_DIR\` (input \`workspace-checkout-dir\`, default \`/home/coder/GIT\`), then re-run.
+
+Startup log (last lines):
+\`\`\`
+${detail:-<empty>}
+\`\`\`"
+  fi
+fi
+echo "    startup ok"
 
 # --- 5. chat -----------------------------------------------------------------
 echo "==> Creating chat pinned to the workspace"
@@ -1066,6 +1190,15 @@ if [ "${FAIL:-1}" -eq 0 ]; then
         | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
     fi
     [ -n "$AGENT_SUMMARY" ] || AGENT_SUMMARY="*The agent did not produce a summary file at \`${SUMMARY_PATH}\`.*"
+
+    # The agent has finished pushing, so the finish script has done its job.
+    # Drop a bootstrapped copy from the branch so it never lands in the repo.
+    # A copy that already sits on $BASE_BRANCH belongs to the repo and stays.
+    if ! gitea_api GET "/repos/$REPO_OWNER/$REPO_NAME/contents/$FINISH_SCRIPT_PATH?ref=$BASE_BRANCH" \
+         >/dev/null 2>&1; then
+      echo "==> Removing the bootstrapped $FINISH_SCRIPT_PATH from $BRANCH"
+      drop_branch_file "$FINISH_SCRIPT_PATH"
+    fi
 
     # The block the action pastes in place of the template marker. Same shape
     # whether we use the built-in body or a template: header, summary, ref and

@@ -18,5 +18,8 @@ description: Default working rules for coder-agent-action — how the agent edit
   dependencies, start servers or contact live/production hosts just to
   double-check facts — reading the code is enough. A documentation-only change
   needs no running application.
+- Verify against the project's own files. Do not dig into vendored framework
+  or library source (CMS core, `vendor/`, `node_modules/`, bundled plugins)
+  unless the change is about that code.
 - Leave nothing behind that the change does not need: no downloaded
   dependencies, build output or scratch files inside the repository.

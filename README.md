@@ -35,12 +35,12 @@ will **run** the workflow — not on the action's own repo.
 | `ACTION_CLONE_TOKEN` | secret, optional | Fallback PAT (scope `read:repository`) used only if `GITEA_TOKEN` can't read the action's repo — e.g. the action lives in a different repo or org. Set it at the **org** level so it's a one-time thing |
 | `CODER_URL` | var | Base URL of the Coder deployment, e.g. `https://coder.example.com` |
 | `CODER_ORG` | var, optional | Coder organization name or UUID. Unset = `coder`, the Coder default |
-| `AGENT_TEMPLATE` | var | Coder template name to build the workspace from, e.g. `dockerUbuntuPython-agent`. Set it at the **org** level and override per repo where a project needs a different image |
-| `AGENT_MODEL` | var, optional | Model name to pin (resolved against the organization's chat models); empty = deployment default |
+| `CODER_TEMPLATE` | var | Coder template name to build the workspace from, e.g. `dockerUbuntuPython-agent`. Set it at the **org** level and override per repo where a project needs a different image |
+| `CODER_MODEL` | var, optional | Model name to pin (resolved against the organization's chat models); empty = deployment default |
 | `AGENT_SKILL_FILE` | var, optional | Repo path of a custom skill file with the agent's working rules, e.g. `.gitea/skills/coder-agent.md`. Empty = `skills/default.md` of this action |
 
 For a second label wired to a second template, copy the job in the workflow
-below and give it its own variable, e.g. `AGENT_TEMPLATE_CLAUDE` — same idea,
+below and give it its own variable, e.g. `CODER_TEMPLATE_CLAUDE` — same idea,
 one variable per job.
 
 ### Skill file
@@ -103,8 +103,8 @@ permissions:
 
 jobs:
   # One job per label: to wire a second label to another template or model,
-  # copy this job, change the label in `if:` and point AGENT_TEMPLATE at its
-  # own variable (e.g. vars.AGENT_TEMPLATE_CLAUDE).
+  # copy this job, change the label in `if:` and point CODER_TEMPLATE at its
+  # own variable (e.g. vars.CODER_TEMPLATE_CLAUDE).
   agent:
     runs-on: ubuntu-24.04
     # Gitea maps `labeled` to action `label_updated`; the added label's name is
@@ -133,13 +133,13 @@ jobs:
       - name: Run Coder Agent on this issue
         env:
           CODER_URL:           ${{ vars.CODER_URL }}
-          CODER_SESSION_TOKEN: ${{ secrets.CODER_TOKEN }}
+          CODER_TOKEN:         ${{ secrets.CODER_TOKEN }}
           CODER_ORG:           ${{ vars.CODER_ORG }}
           # Template name comes from the repo (or org) variable, so switching
           # templates is a settings change, not a commit.
-          AGENT_TEMPLATE:      ${{ vars.AGENT_TEMPLATE }}
+          CODER_TEMPLATE:      ${{ vars.CODER_TEMPLATE }}
           # Optional: pin a model by name (empty = deployment default).
-          AGENT_MODEL:         ${{ vars.AGENT_MODEL }}
+          CODER_MODEL:         ${{ vars.CODER_MODEL }}
           FORGE_TOKEN:         ${{ secrets.GITEA_TOKEN }}   # automatic per-job token
           STOP_AFTER:          "1h"    # keep the workspace for debugging
           # The clone URL comes from the repo's own ssh_url. Only set these if
@@ -169,8 +169,8 @@ vars, and no PAT:
           coder-url:           ${{ vars.CODER_URL }}
           coder-token:         ${{ secrets.CODER_TOKEN }}
           coder-organization:  ${{ vars.CODER_ORG }}
-          coder-template-name: ${{ vars.AGENT_TEMPLATE }}
-          coder-model:         ${{ vars.AGENT_MODEL }}
+          coder-template-name: ${{ vars.CODER_TEMPLATE }}
+          coder-model:         ${{ vars.CODER_MODEL }}
           gitea-token:         ${{ secrets.GITEA_TOKEN }}
           stop-after:          "1h"
 ```
@@ -349,6 +349,13 @@ clones the base branch by default, so the agent's first instructed action is a
 Set `bootstrap-finish-script: false` to make a missing file a hard error
 instead — the action will then never write to the repository on its own.
 
+The bootstrapped script does **not** stay in the repo: once the agent has
+pushed, the action deletes it from the issue branch again (a
+`ci: remove agent helper file …` commit), so it never shows up in the PR.
+Every run bootstraps it afresh. If you want the script in the repo — e.g. to
+customise it — commit it to the base branch yourself; a copy found there is
+never removed.
+
 ## Inputs
 
 | input | default | notes |
@@ -356,7 +363,7 @@ instead — the action will then never write to the repository on its own.
 | `coder-url` | — | required |
 | `coder-token` | — | required, service-account session token |
 | `coder-organization` | `coder` | name or UUID |
-| `coder-template-name` | — | template name, normally `${{ vars.AGENT_TEMPLATE }}`; or a UUID via `coder-template-id` |
+| `coder-template-name` | — | template name, normally `${{ vars.CODER_TEMPLATE }}`; or a UUID via `coder-template-id` |
 | `coder-model` | *(empty)* | model name, resolved against the organization's chat models; empty = deployment default. `coder-model-config-id` takes a UUID directly |
 | `gitea-token` | — | required; `secrets.GITEA_TOKEN` works |
 | `gitea-url` | current server | |
@@ -412,8 +419,8 @@ Everything is env-driven, so the same script works from a shell on the Gitea
 server — handy for debugging a template change:
 
 ```bash
-export CODER_URL=https://coder.example.com CODER_SESSION_TOKEN=... \
-       CODER_ORG=coder AGENT_TEMPLATE=dockerUbuntuPython-agent \
+export CODER_URL=https://coder.example.com CODER_TOKEN=... \
+       CODER_ORG=coder CODER_TEMPLATE=dockerUbuntuPython-agent \
        GITEA_URL=https://gitea.example.com GITEA_TOKEN=... \
        REPO_OWNER=GITEA REPO_NAME=someproject ISSUE_NUM=42
 bash coder-agent-issue.sh
@@ -442,6 +449,19 @@ Coder API: GET /api/v2/users/me -> HTTP 401
   can't read the issue or write the branch; it needs repo + issue + PR scope.
 - **HTTP 000** — the runner can't reach the host at all: wrong `CODER_URL` /
   `gitea-url`, or a network the runner container isn't on.
+- **"The workspace could not clone …"** — after the build is `running` the
+  action waits for the workspace agent's startup script and scans its log for
+  git clone/auth errors (`Permission denied (publickey)`, `Could not read from
+  remote repository`, …) or a `start_error` lifecycle. If it finds any, it stops
+  the workspace and posts the log excerpt to the issue instead of starting the
+  agent on an empty checkout. Usually the Coder user's git SSH key
+  (`coder publickey`) isn't added to a Gitea account that can read the repo.
+- **"The workspace has no git checkout at …"** — the startup log had no clone
+  error, but `<workspace-checkout-dir>/<repo>/.git` doesn't exist (checked via
+  the agent's file-listing API, with a ~30s grace period). The template skipped
+  the clone or cloned into a different directory than `workspace-checkout-dir`.
+  If the Coder version has no file-listing API, the check is skipped with a
+  warning in the runner log.
 
 The comment on the issue looks like this:
 

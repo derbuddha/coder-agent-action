@@ -295,11 +295,11 @@ runs:
       shell: bash
       env:
         CODER_URL:            ${{ inputs.coder-url }}
-        CODER_SESSION_TOKEN:  ${{ inputs.coder-token }}
+        CODER_TOKEN:          ${{ inputs.coder-token }}
         CODER_ORG:            ${{ inputs.coder-organization }}
-        AGENT_TEMPLATE:       ${{ inputs.coder-template-name }}
-        AGENT_TEMPLATE_ID:    ${{ inputs.coder-template-id }}
-        AGENT_MODEL:          ${{ inputs.coder-model }}
+        CODER_TEMPLATE:       ${{ inputs.coder-template-name }}
+        CODER_TEMPLATE_ID:    ${{ inputs.coder-template-id }}
+        CODER_MODEL:          ${{ inputs.coder-model }}
         MODEL_CONFIG_ID:      ${{ inputs.coder-model-config-id }}
         CODER_CHAT_PATH:      ${{ inputs.coder-chat-path }}
         WS_NAME_PREFIX:       ${{ inputs.workspace-name-prefix }}

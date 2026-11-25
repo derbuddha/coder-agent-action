@@ -3,8 +3,10 @@
 # .gitea/scripts/finish-issue.sh  —  lives IN the repository.
 #
 # This copy is shipped with the Coder Agent action: if the file is missing from
-# the base branch, the action commits it there before the agent starts. Once it
-# is in the repo you own it — edit it freely, the action will not touch it again.
+# the base branch, the action commits it onto the issue branch before the agent
+# starts and deletes it again before the PR opens. To own and customise it,
+# commit it to the base branch — the action then uses that copy and never
+# touches it.
 #
 # The agent only edits files; this wrapper does all git deterministically, so a
 # model that forgets `git add` or stops mid-thought can't break the pipeline.
