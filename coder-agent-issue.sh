@@ -37,11 +37,8 @@ CODER_TOKEN="${CODER_TOKEN:-${CODER_SESSION_TOKEN:-}}"
 GITEA_TOKEN="${GITEA_TOKEN:-${FORGE_TOKEN:-}}"
 : "${GITEA_TOKEN:?set GITEA_TOKEN (shell) or FORGE_TOKEN (CI) — needs repo+issue+PR scope}"
 
-if [ -z "${CODER_TEMPLATE_ID:-}" ] && [ -z "${CODER_TEMPLATE:-}" ]; then
-  echo "Set coder-template-name (or coder-template-id). In Actions this comes"
-  echo "from the CODER_TEMPLATE repo/org variable — check it is set and not empty."
-  exit 1
-fi
+# "Is a template set at all?" is checked in step 1, after the repo's
+# devcontainer.json has had the chance to name one (see DEVCONTAINER_PATH).
 
 # --- defaults / fall-backs from the runner environment -----------------------
 CODER_URL="${CODER_URL%/}"
@@ -135,6 +132,10 @@ WS_CHECKOUT_DIR="${WS_CHECKOUT_DIR:-/home/coder/GIT}"
 SECTION_BEGIN="${SECTION_BEGIN:-<!-- agent:begin -->}"
 SECTION_END="${SECTION_END:-<!-- agent:end -->}"
 GIT_REPO_PARAM="${GIT_REPO_PARAM:-git_repo_url}"
+# Repo file that may name the template (customizations.coder.template), read
+# from BASE_BRANCH. Wins over coder-template-name; coder-template-id still wins
+# over both. Set to empty to skip the lookup (hence `-`, not `:-`).
+DEVCONTAINER_PATH="${DEVCONTAINER_PATH-.devcontainer/devcontainer.json}"
 WS_NAME_PREFIX="${WS_NAME_PREFIX:-agent}"
 CODER_CHAT_PATH="${CODER_CHAT_PATH:-/agents/}"
 POLL_TIMEOUT="${POLL_TIMEOUT:-3600}"
@@ -487,14 +488,59 @@ echo "    chat_api=$CHAT_API"
   || die "No enabled LLM model is configured on $CODER_URL." \
          "Add a provider and model to the Coder deployment (organization '$CODER_ORG'), then re-run."
 
+# Template from the repo's devcontainer, if it names one (customizations.coder.template).
+# Same JSONC handling as the Gitea "Open in Coder" button: comments and trailing
+# commas are fine. coder-template-id still wins over both names.
+TEMPLATE_SOURCE="coder-template-name (CODER_TEMPLATE variable)"
+if [ -z "${CODER_TEMPLATE_ID:-}" ] && [ -n "$DEVCONTAINER_PATH" ]; then
+  echo "==> Template from $DEVCONTAINER_PATH on $BASE_BRANCH?"
+  DC_FILE=$(mktemp "${TMPDIR:-/tmp}/coder-agent-devcontainer.XXXXXX")
+  if gitea_api GET "/repos/$REPO_OWNER/$REPO_NAME/raw/$DEVCONTAINER_PATH?ref=$BASE_BRANCH" \
+       > "$DC_FILE" 2>/dev/null; then
+    DC_TEMPLATE=$(python3 - "$DC_FILE" 2>/dev/null <<'PY'
+import json, re, sys
+s = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+# JSONC -> JSON: drop comments outside strings, then trailing commas
+s = re.sub(r'("(?:\\.|[^"\\])*")|//[^\n]*|/\*.*?\*/', lambda m: m.group(1) or "", s, flags=re.S)
+s = re.sub(r',(\s*[}\]])', r'\1', s)
+try:
+    t = json.loads(s).get("customizations", {}).get("coder", {}).get("template", "")
+except Exception:
+    t = ""
+print(t if isinstance(t, str) else "")
+PY
+    ) || DC_TEMPLATE=""
+    if [ -z "$DC_TEMPLATE" ]; then
+      echo "    no customizations.coder.template in it"
+    elif [[ ! "$DC_TEMPLATE" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+      echo "!! Ignoring invalid template name '$DC_TEMPLATE' in $DEVCONTAINER_PATH"
+    else
+      if [ -n "${CODER_TEMPLATE:-}" ] && [ "$CODER_TEMPLATE" != "$DC_TEMPLATE" ]; then
+        echo "    overrides coder-template-name '$CODER_TEMPLATE'"
+      fi
+      CODER_TEMPLATE="$DC_TEMPLATE"
+      TEMPLATE_SOURCE="$DEVCONTAINER_PATH on $BASE_BRANCH"
+      echo "    template=$CODER_TEMPLATE"
+    fi
+  else
+    echo "    not found"
+  fi
+  rm -f "$DC_FILE"
+  : > "$API_ERR_FILE"  # a missing or unreadable file is not the run's failure reason
+fi
+if [ -z "${CODER_TEMPLATE_ID:-}" ] && [ -z "${CODER_TEMPLATE:-}" ]; then
+  die "No Coder template configured." \
+      "Name one in \`${DEVCONTAINER_PATH:-.devcontainer/devcontainer.json}\` (customizations.coder.template), or set the \`CODER_TEMPLATE\` repo/org variable."
+fi
+
 if [ -z "${CODER_TEMPLATE_ID:-}" ]; then
-  echo "==> Resolving template '$CODER_TEMPLATE' -> UUID"
+  echo "==> Resolving template '$CODER_TEMPLATE' (from $TEMPLATE_SOURCE) -> UUID"
   CODER_TEMPLATE_ID=$(coder_api GET \
     "/api/v2/organizations/$CODER_ORG_ID/templates/$CODER_TEMPLATE" | jq -r '.id // empty') \
     || CODER_TEMPLATE_ID=""
   [ -n "$CODER_TEMPLATE_ID" ] \
     || die "Could not resolve template '$CODER_TEMPLATE' in organization '$CODER_ORG'." \
-           "Check the \`CODER_TEMPLATE\` variable against the template names on $CODER_URL/templates."
+           "The name came from $TEMPLATE_SOURCE — check it against the template names on $CODER_URL/templates (exact case)."
 fi
 echo "    template_id=$CODER_TEMPLATE_ID"
 

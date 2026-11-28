@@ -100,8 +100,10 @@ jobs:
           coder-url:            ${{ vars.CODER_URL }}
           coder-token:          ${{ secrets.CODER_TOKEN }}
           coder-organization:   ${{ vars.CODER_ORG_ID }}
-          # Template name comes from the repo (or org) variable, so switching
-          # templates is a settings change, not a commit.
+          # Template: customizations.coder.template in the repo's
+          # .devcontainer/devcontainer.json wins (same entry the Gitea "Open in
+          # Coder" button uses). Without it, the repo (or org) variable is used.
+          # Set devcontainer-path: "" to always use the variable.
           coder-template-name:  ${{ vars.CODER_TEMPLATE }}
           # Optional: pin a model by name (empty = deployment default).
           coder-model:          ${{ vars.CODER_MODEL }}

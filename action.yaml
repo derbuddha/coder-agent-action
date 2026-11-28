@@ -21,13 +21,23 @@ inputs:
     required: false
     default: "coder"
   coder-template-name:
-    description: "Template NAME to build the workspace from, e.g. dockerUbuntuPython-agent."
+    description: >-
+      Template NAME to build the workspace from, e.g. dockerUbuntuPython-agent.
+      Fallback only: a customizations.coder.template entry in devcontainer-path
+      wins over it.
     required: false
     default: ""
   coder-template-id:
-    description: "Template UUID. Wins over coder-template-name if both are set."
+    description: "Template UUID. Wins over coder-template-name and devcontainer-path."
     required: false
     default: ""
+  devcontainer-path:
+    description: >-
+      Repo file read from base-branch. If it has customizations.coder.template
+      (JSONC is fine), that template is used instead of coder-template-name.
+      Missing file or entry = use coder-template-name. Empty = skip the lookup.
+    required: false
+    default: ".devcontainer/devcontainer.json"
   coder-model:
     description: "Model name to pin, resolved against the organization's chat models (e.g. MiniMax-M3). Empty = deployment default."
     required: false
@@ -298,6 +308,7 @@ runs:
         CODER_TOKEN:          ${{ inputs.coder-token }}
         CODER_ORG:            ${{ inputs.coder-organization }}
         CODER_TEMPLATE:       ${{ inputs.coder-template-name }}
+        DEVCONTAINER_PATH:    ${{ inputs.devcontainer-path }}
         CODER_TEMPLATE_ID:    ${{ inputs.coder-template-id }}
         CODER_MODEL:          ${{ inputs.coder-model }}
         MODEL_CONFIG_ID:      ${{ inputs.coder-model-config-id }}
